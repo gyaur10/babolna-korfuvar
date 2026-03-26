@@ -133,7 +133,7 @@ if uploaded_file is not None:
                     korfuvarok.append((global_kor_id, vontatmany, current_kor_legs))
 
             # Segédfüggvény: irányon belül kezdő/záró időpont + cím a fuvarszámtörzs-szabály szerint
-            def get_interval_with_addresses(legs_df):
+def get_interval_with_addresses(legs_df):
     # Üres irány
     if legs_df is None or legs_df.empty:
         return (pd.NaT, None, pd.NaT, None)
