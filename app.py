@@ -134,41 +134,70 @@ if uploaded_file is not None:
 
             # Segédfüggvény: irányon belül kezdő/záró időpont + cím a fuvarszámtörzs-szabály szerint
             def get_interval_with_addresses(legs_df):
-                if legs_df.empty:
-                    return (pd.NaT, None, pd.NaT, None)
+    # Üres irány
+    if legs_df is None or legs_df.empty:
+        return (pd.NaT, None, pd.NaT, None)
 
-                # dolgozzunk a fuvarszám-törzzsel
-                legs_df = legs_df.copy()
-                legs_df['Fuvar_torzs'] = legs_df['Fuvarszám'].astype(str).str.split('-').str[0]
+    # Ha hiányzik bármelyik szükséges oszlop, szintén térjünk vissza üresen
+    needed_cols = [
+        'Fuvarszám',
+        'Első Felvételi állomás időkapu (dátum)',
+        'Utolsó Leadási állomás időkapu (dátum)',
+        'Első Felvételi állomás cím',
+        'Utolsó Leadási állomás cím',
+    ]
+    for c in needed_cols:
+        if c not in legs_df.columns:
+            return (pd.NaT, None, pd.NaT, None)
 
-                # kezdő pont: ha van olyan törzs, ami többször szerepel, arra a legkisebb részfeladat
-                dup_torzsek = legs_df['Fuvar_torzs'].value_counts()
-                dup_torzsek = dup_torzsek[dup_torzsek > 1].index.tolist()
+    # Ha minden dátum NaT az adott irányban, nincs értelmezhető intervallum
+    if legs_df['Első Felvételi állomás időkapu (dátum)'].dropna().empty or \
+       legs_df['Utolsó Leadási állomás időkapu (dátum)'].dropna().empty:
+        return (pd.NaT, None, pd.NaT, None)
 
-                if dup_torzsek:
-                    # az első ilyen törzs alapján
-                    t = dup_torzsek[0]
-                    same = legs_df[legs_df['Fuvar_torzs'] == t].copy()
-                    # részfeladat szám: Fuvarszám utáni -n rész
-                    same['Reszfeladat'] = same['Fuvarszám'].astype(str).str.split('-').str[1].astype(int)
-                    row_start = same.loc[same['Reszfeladat'].idxmin()]
-                    row_end = same.loc[same['Reszfeladat'].idxmax()]
-                    start_dt = row_start['Első Felvételi állomás időkapu (dátum)']
-                    start_addr = row_start['Első Felvételi állomás cím']
-                    end_dt = row_end['Utolsó Leadási állomás időkapu (dátum)']
-                    end_addr = row_end['Utolsó Leadási állomás cím']
-                else:
-                    # nincs ismétlődő törzs -> sima min/max
-                    idx_start = legs_df['Első Felvételi állomás időkapu (dátum)'].idxmin()
-                    idx_end = legs_df['Utolsó Leadási állomás időkapu (dátum)'].idxmax()
-                    row_start = legs_df.loc[idx_start]
-                    row_end = legs_df.loc[idx_end]
-                    start_dt = row_start['Első Felvételi állomás időkapu (dátum)']
-                    start_addr = row_start['Első Felvételi állomás cím']
-                    end_dt = row_end['Utolsó Leadási állomás időkapu (dátum)']
-                    end_addr = row_end['Utolsó Leadási állomás cím']
+    legs_df = legs_df.copy()
+    legs_df['Fuvar_torzs'] = legs_df['Fuvarszám'].astype(str).str.split('-').str[0]
 
-                return (start_dt, start_addr, end_dt, end_addr)
+    # ismétlődő fuvarszámtörzsek
+    dup_torzsek = legs_df['Fuvar_torzs'].value_counts()
+    dup_torzsek = dup_torzsek[dup_torzsek > 1].index.tolist()
+
+    if dup_torzsek:
+        t = dup_torzsek[0]
+        same = legs_df[legs_df['Fuvar_torzs'] == t].copy()
+
+        # ha valamiért mégsem lenne sor, fallback
+        if same.empty:
+            # visszaesünk a sima min/max logikára
+            idx_start = legs_df['Első Felvételi állomás időkapu (dátum)'].idxmin()
+            idx_end = legs_df['Utolsó Leadási állomás időkapu (dátum)'].idxmax()
+            row_start = legs_df.loc[idx_start]
+            row_end = legs_df.loc[idx_end]
+        else:
+            same['Reszfeladat'] = (
+                same['Fuvarszám'].astype(str).str.split('-').str[1].astype(int)
+            )
+            row_start = same.loc[same['Reszfeladat'].idxmin()]
+            row_end = same.loc[same['Reszfeladat'].idxmax()]
+    else:
+        # nincs ismétlődő törzs -> sima min/max, csak nem NaT értékekre
+        valid_start = legs_df.dropna(subset=['Első Felvételi állomás időkapu (dátum)'])
+        valid_end = legs_df.dropna(subset=['Utolsó Leadási állomás időkapu (dátum)'])
+
+        if valid_start.empty or valid_end.empty:
+            return (pd.NaT, None, pd.NaT, None)
+
+        idx_start = valid_start['Első Felvételi állomás időkapu (dátum)'].idxmin()
+        idx_end = valid_end['Utolsó Leadási állomás időkapu (dátum)'].idxmax()
+        row_start = legs_df.loc[idx_start]
+        row_end = legs_df.loc[idx_end]
+
+    start_dt = row_start['Első Felvételi állomás időkapu (dátum)']
+    start_addr = row_start['Első Felvételi állomás cím']
+    end_dt = row_end['Utolsó Leadási állomás időkapu (dátum)']
+    end_addr = row_end['Utolsó Leadási állomás cím']
+
+    return (start_dt, start_addr, end_dt, end_addr)
 
             # Kimeneti táblázat építése MINDEN körből
             output_rows = []
