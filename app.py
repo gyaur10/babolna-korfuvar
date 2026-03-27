@@ -50,7 +50,6 @@ def classify_leg_direction(row):
 
 
 def get_interval_with_addresses(legs_df: pd.DataFrame):
-    # Üres irány
     if legs_df is None or legs_df.empty:
         return (pd.NaT, None, pd.NaT, None)
 
@@ -226,9 +225,7 @@ if uploaded_file is not None:
                 sem_kezd_ido, sem_kezd_cim, sem_zar_ido, sem_zar_cim = get_interval_with_addresses(semleges_legs)
                 bef_kezd_ido, bef_kezd_cim, bef_zar_ido, bef_zar_cim = get_interval_with_addresses(befele_legs)
 
-                # Irányok listája a körön belül, sorrendben
                 iranyok_korben = legs_df['Irány'].tolist()
-                # Teljes kör-e (van kifelé és befelé is)
                 teljes_kor = any(i.startswith('kifelé') for i in iranyok_korben) and \
                              any(i.startswith('befelé') for i in iranyok_korben)
 
@@ -260,51 +257,103 @@ if uploaded_file is not None:
                     'Összes díj részarány (EUR)': total_dij,
                     'Deviza': 'EUR',
 
-                    # ideiglenesen csak a teljes_kor flaget mentjük, magyarázatot később számoljuk
                     '_Teljes_kor': teljes_kor,
+                    '_Korben_Fuvarszam_lista': legs_df['Fuvarszám'].astype(str).tolist(),
                 }
                 output_rows.append(row)
 
             result_df_all = pd.DataFrame(output_rows)
 
-            # Magyarázat + szín meghatározása körszinten,
-            # a következő kör (ha van) alapján
-            explanations = []
-            colors = []
+            # Magyarázat + szín meghatározása
+            magy = []
+            szin = []
+
             for idx, row in result_df_all.iterrows():
                 teljes_kor = row['_Teljes_kor']
+                kor_fuv_lista = row['_Korben_Fuvarszam_lista']
 
-                # alapértelmezett
-                exp = "Egyéb logikai feltétel miatt új kör indul (irány/járat/fuvarszám)."
+                # default: narancs, később pontosítjuk
+                exp = ""
                 color = "background-color: orange"
 
-                # ha teljes kifelé-befelé kör, akkor zöld indoklás
+                # Teljes kör esetén zöld alap
                 if teljes_kor:
                     exp = "Teljes kifelé–befelé kör lezárása után új kör indul."
                     color = "background-color: lightgreen"
 
-                # ha van következő kör, és más a vontatmány → piros
-                if idx < len(result_df_all) - 1:
-                    next_row = result_df_all.iloc[idx + 1]
-                    if next_row['Vontatmány'] != row['Vontatmány']:
-                        exp = "Pótkocsi váltás miatt új kör indul."
-                        color = "background-color: lightcoral"
+                # Piros: ugyanazon fuvarszám-törzs több vontatmánnyal
+                # végig a teljes eredeti df-en nézzük
+                valtozo_vontatmany = False
+                problem_fuv_torzs = None
+                for f in kor_fuv_lista:
+                    torzs = f.split('-')[0]
+                    same_torzs = df[df['Fuvarszám'].astype(str).str.startswith(torzs + "-")]
+                    if not same_torzs.empty:
+                        if same_torzs['Vontatmány'].nunique() > 1:
+                            valtozo_vontatmany = True
+                            problem_fuv_torzs = torzs
+                            break
 
-                explanations.append(exp)
-                colors.append(color)
+                if valtozo_vontatmany:
+                    exp = f"Változó vontatmány hiba: a {problem_fuv_torzs} fuvarszám törzs több különböző vontatmányon fut."
+                    color = "background-color: lightcoral"
 
-            result_df_all['Magyarázat'] = explanations
-            result_df_all['Magyarázat_szín'] = colors
+                # Ha sem zöld, sem piros nem lett, építsünk részletes narancs magyarázatot
+                if not exp:
+                    changes = []
 
-            # Hónap szűrés KÖR szinten, a Kör vége dátuma alapján
+                    # nézzük a következő kört, ha van
+                    if idx < len(result_df_all) - 1:
+                        next_row = result_df_all.iloc[idx + 1]
+
+                        # irányperiféria: utolsó és következő kör irányai
+                        # (csak információs jelleggel)
+                        # Fuvarszám-törzs és járatszám metszet
+                        current_fuv_torzsek = {
+                            f.split('-')[0] for f in row['_Korben_Fuvarszam_lista']
+                        }
+                        next_fuv_torzsek = {
+                            f.split('-')[0] for f in next_row['_Korben_Fuvarszam_lista']
+                        }
+                        common_torzs = current_fuv_torzsek.intersection(next_fuv_torzsek)
+                        common_jarat = set(
+                            row['Járatszámok'].split(' | ')
+                            if isinstance(row['Járatszámok'], str) and row['Járatszámok'] else []
+                        ).intersection(
+                            set(next_row['Járatszámok'].split(' | ')
+                                if isinstance(next_row['Járatszámok'], str) and next_row['Járatszámok'] else [])
+                        )
+
+                        if not common_torzs:
+                            changes.append("fuvarszám-törzs változás")
+                        if not common_jarat:
+                            changes.append("járatszám változás")
+
+                        # irány mint információ: jelen kör irányai
+                        iranyok = row['_Korben_Fuvarszam_lista']  # csak placeholder, ha kellene bővíteni
+
+                    if not changes:
+                        changes.append("irány/járat/fuvarszám mintázat eltérés")
+
+                    exp = "Új kör indul, mert " + ", ".join(changes) + " történik."
+                    color = "background-color: orange"
+
+                magy.append(exp)
+                szin.append(color)
+
+            result_df_all['Magyarázat'] = magy
+            result_df_all['Magyarázat_szín'] = szin
+
             mask = (
                 (result_df_all['Kör vége dátum'].dt.year == selected_year) &
                 (result_df_all['Kör vége dátum'].dt.month == selected_month)
             )
             result_df = result_df_all[mask].reset_index(drop=True)
 
-            # _Teljes_kor és Magyarázat_szín technikai mezők közül csak a színt használjuk stylinghoz
-            result_df_display = result_df.drop(columns=['_Teljes_kor'], errors='ignore')
+            result_df_display = result_df.drop(
+                columns=['_Teljes_kor', '_Korben_Fuvarszam_lista'],
+                errors='ignore'
+            )
 
             def highlight_explanation(row):
                 return [
