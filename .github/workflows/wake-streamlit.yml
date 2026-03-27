@@ -21,12 +21,11 @@ jobs:
           python-version: "3.11"
 
       - name: Set up Chrome
-        id: chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: "stable"
           install-dependencies: "true"
-          install-chromedriver: "true"
+          install-chromedriver: "false"   # <-- fontos
 
       - name: Install dependencies
         run: |
@@ -34,9 +33,5 @@ jobs:
           pip install selenium
 
       - name: Wake Streamlit app
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
-          CHROMEDRIVER_PATH: ${{ steps.chrome.outputs.chromedriver-path }}
         run: |
           python wake_streamlit.py
-
