@@ -54,7 +54,6 @@ def get_interval_with_addresses(legs_df: pd.DataFrame):
     if legs_df is None or legs_df.empty:
         return (pd.NaT, None, pd.NaT, None)
 
-    # Ha hiányzik bármelyik szükséges oszlop, szintén térjünk vissza üresen
     needed_cols = [
         'Fuvarszám',
         'Első Felvételi állomás időkapu (dátum)',
@@ -66,7 +65,6 @@ def get_interval_with_addresses(legs_df: pd.DataFrame):
         if c not in legs_df.columns:
             return (pd.NaT, None, pd.NaT, None)
 
-    # Ha minden dátum NaT az adott irányban, nincs értelmezhető intervallum
     if legs_df['Első Felvételi állomás időkapu (dátum)'].dropna().empty or \
        legs_df['Utolsó Leadási állomás időkapu (dátum)'].dropna().empty:
         return (pd.NaT, None, pd.NaT, None)
@@ -74,7 +72,6 @@ def get_interval_with_addresses(legs_df: pd.DataFrame):
     legs_df = legs_df.copy()
     legs_df['Fuvar_torzs'] = legs_df['Fuvarszám'].astype(str).str.split('-').str[0]
 
-    # ismétlődő fuvarszámtörzsek
     dup_torzsek = legs_df['Fuvar_torzs'].value_counts()
     dup_torzsek = dup_torzsek[dup_torzsek > 1].index.tolist()
 
@@ -82,7 +79,6 @@ def get_interval_with_addresses(legs_df: pd.DataFrame):
         t = dup_torzsek[0]
         same = legs_df[legs_df['Fuvar_torzs'] == t].copy()
 
-        # ha valamiért mégsem lenne sor, fallback
         if same.empty:
             valid_start = legs_df.dropna(subset=['Első Felvételi állomás időkapu (dátum)'])
             valid_end = legs_df.dropna(subset=['Utolsó Leadási állomás időkapu (dátum)'])
@@ -101,7 +97,6 @@ def get_interval_with_addresses(legs_df: pd.DataFrame):
             row_start = same.loc[same['Reszfeladat'].idxmin()]
             row_end = same.loc[same['Reszfeladat'].idxmax()]
     else:
-        # nincs ismétlődő törzs -> sima min/max, csak nem NaT értékekre
         valid_start = legs_df.dropna(subset=['Első Felvételi állomás időkapu (dátum)'])
         valid_end = legs_df.dropna(subset=['Utolsó Leadási állomás időkapu (dátum)'])
 
@@ -231,6 +226,12 @@ if uploaded_file is not None:
                 sem_kezd_ido, sem_kezd_cim, sem_zar_ido, sem_zar_cim = get_interval_with_addresses(semleges_legs)
                 bef_kezd_ido, bef_kezd_cim, bef_zar_ido, bef_zar_cim = get_interval_with_addresses(befele_legs)
 
+                # Irányok listája a körön belül, sorrendben
+                iranyok_korben = legs_df['Irány'].tolist()
+                # Teljes kör-e (van kifelé és befelé is)
+                teljes_kor = any(i.startswith('kifelé') for i in iranyok_korben) and \
+                             any(i.startswith('befelé') for i in iranyok_korben)
+
                 row = {
                     'Kör ID': kor_id,
                     'Vontatmány': vontatmany,
@@ -258,10 +259,42 @@ if uploaded_file is not None:
                     'Fuvarszámok': ', '.join(legs_df['Fuvarszám'].astype(str).tolist()),
                     'Összes díj részarány (EUR)': total_dij,
                     'Deviza': 'EUR',
+
+                    # ideiglenesen csak a teljes_kor flaget mentjük, magyarázatot később számoljuk
+                    '_Teljes_kor': teljes_kor,
                 }
                 output_rows.append(row)
 
             result_df_all = pd.DataFrame(output_rows)
+
+            # Magyarázat + szín meghatározása körszinten,
+            # a következő kör (ha van) alapján
+            explanations = []
+            colors = []
+            for idx, row in result_df_all.iterrows():
+                teljes_kor = row['_Teljes_kor']
+
+                # alapértelmezett
+                exp = "Egyéb logikai feltétel miatt új kör indul (irány/járat/fuvarszám)."
+                color = "background-color: orange"
+
+                # ha teljes kifelé-befelé kör, akkor zöld indoklás
+                if teljes_kor:
+                    exp = "Teljes kifelé–befelé kör lezárása után új kör indul."
+                    color = "background-color: lightgreen"
+
+                # ha van következő kör, és más a vontatmány → piros
+                if idx < len(result_df_all) - 1:
+                    next_row = result_df_all.iloc[idx + 1]
+                    if next_row['Vontatmány'] != row['Vontatmány']:
+                        exp = "Pótkocsi váltás miatt új kör indul."
+                        color = "background-color: lightcoral"
+
+                explanations.append(exp)
+                colors.append(color)
+
+            result_df_all['Magyarázat'] = explanations
+            result_df_all['Magyarázat_szín'] = colors
 
             # Hónap szűrés KÖR szinten, a Kör vége dátuma alapján
             mask = (
@@ -270,12 +303,21 @@ if uploaded_file is not None:
             )
             result_df = result_df_all[mask].reset_index(drop=True)
 
+            # _Teljes_kor és Magyarázat_szín technikai mezők közül csak a színt használjuk stylinghoz
+            result_df_display = result_df.drop(columns=['_Teljes_kor'], errors='ignore')
+
+            def highlight_explanation(row):
+                return [
+                    row['Magyarázat_szín'] if col == 'Magyarázat' else ''
+                    for col in row.index
+                ]
+
             st.subheader("Generált körfuvarok (kiválasztott hónap szerint)")
-            st.dataframe(result_df)
+            st.dataframe(result_df_display.style.apply(highlight_explanation, axis=1))
 
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                result_df.to_excel(writer, index=False, sheet_name='körfuvarok')
+                result_df_display.to_excel(writer, index=False, sheet_name='körfuvarok')
             buffer.seek(0)
 
             st.download_button(
