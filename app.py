@@ -434,18 +434,22 @@ def aggregate_flight_controlling_for_rings(result_df: pd.DataFrame,
         result_df['Üres km %'] = [
             _safe_div_pct(u, k) for u, k in zip(result_df['Üres km'], result_df['Menetlevél ∑ km'])
         ]
-    # Felhasználó által specifikált képlet:
-    #   Menetlevél tankolás / 100 km = Menetlevél tankolás * Menetlevél ∑ km / 100
+    # Menetlevél tankolás / 100 km = Menetlevél tankolás / (Menetlevél ∑ km / 100)
+    #   (azaz L/100 km: a megtett 100 km-re jutó tankolás mennyisége)
     if 'Menetlevél tankolás' in result_df.columns and 'Menetlevél ∑ km' in result_df.columns:
         vals = []
         for t, k in zip(result_df['Menetlevél tankolás'], result_df['Menetlevél ∑ km']):
             if pd.isna(t) or pd.isna(k):
                 vals.append(None)
-            else:
-                try:
-                    vals.append(float(t) * float(k) / 100.0)
-                except (ValueError, TypeError):
+                continue
+            try:
+                k_f = float(k)
+                if k_f == 0:
                     vals.append(None)
+                else:
+                    vals.append(float(t) / (k_f / 100.0))
+            except (ValueError, TypeError, ZeroDivisionError):
+                vals.append(None)
         result_df['Menetlevél tankolás / 100 km'] = vals
 
     return result_df
