@@ -5,9 +5,12 @@ import pandas as pd
 import streamlit as st
 from openpyxl.styles import PatternFill
 
-APP_VERSION = 'v4.3'
+APP_VERSION = 'v4.4'
 APP_RELEASE_DATE = '2026-07-15'
 APP_CHANGELOG = {
+    'v4.4 (2026-07-15)': 'Körfuvar-only mód: ha nincs költség / eredménykimutatás fájl '
+                         'feltöltve, csak a körfuvar-generálás és a hibalisták futnak le '
+                         '(aggregálás és profit-elemzés kihagyva) — gyorsabb hibajavítási kör.',
     'v4.3 (2026-07-15)': 'Több fuvarnapló feltöltés + dedup, év-hónap multiselect, '
                          'hónaponként külön Excel egy futásban, opcionális összesítő Excel, '
                          'eltérő tartalmú duplikátum figyelmeztetés.',
@@ -1619,8 +1622,13 @@ def build_summary_xlsx(month_results: dict, tipushiba_all: pd.DataFrame,
     a teljes időszakra aggregált ország-reláció és megbízó elemzés."""
     havi_df = build_havi_osszesito_table(month_results)
     combined = pd.concat(month_results.values(), ignore_index=True)
-    relacio_df = build_relacio_table(combined)
-    megbizo_df = build_megbizo_table(combined)
+    # Körfuvar-only módban (nincs költség-adat) a profit-elemzés fülek kimaradnak
+    if 'Teljes költség' in combined.columns:
+        relacio_df = build_relacio_table(combined)
+        megbizo_df = build_megbizo_table(combined)
+    else:
+        relacio_df = pd.DataFrame()
+        megbizo_df = pd.DataFrame()
 
     buffer = io.BytesIO()
     head_fill = PatternFill('solid', start_color='D9E1F2')
@@ -1780,6 +1788,19 @@ if uploaded_logbooks:
                         f'🛣️ Eredménykimutatás fájl(ok) feldolgozva: {len(combined_fc_df)} egyedi járat.'
                     )
 
+                # Körfuvar-only mód: ha SEM költség, SEM eredménykimutatás fájl nincs
+                # feltöltve, a feldolgozás csak a körfuvarok generálására terjed ki
+                # (nincs költség/futási aggregálás, Teljes költség, Járati eredmény,
+                # ország-reláció és megbízó profit-elemzés) → gyorsabb futás a
+                # rögzítési hibák javítási köreihez.
+                korfuvar_only = (not has_cost) and (not has_fc)
+                if korfuvar_only:
+                    st.info(
+                        '⚡ Körfuvar-only mód: nincs feltöltve költség / eredménykimutatás '
+                        'fájl, ezért csak a körfuvar-generálás és a hibalisták készülnek el '
+                        '(költség- és futásadat-aggregálás kihagyva).'
+                    )
+
                 outputs = {}
                 month_views = {}
                 month_results = {}
@@ -1793,25 +1814,31 @@ if uploaded_logbooks:
                         st.warning(f'⚠️ {label}: nincs kör ebben a hónapban, kihagyva.')
                         continue
 
-                    if has_cost:
-                        result_df = aggregate_cost_for_rings(
-                            result_df, combined_cost_df, cost_categories)
-                    if has_fc:
-                        result_df = aggregate_flight_controlling_for_rings(
-                            result_df, combined_fc_df)
+                    if not korfuvar_only:
+                        if has_cost:
+                            result_df = aggregate_cost_for_rings(
+                                result_df, combined_cost_df, cost_categories)
+                        if has_fc:
+                            result_df = aggregate_flight_controlling_for_rings(
+                                result_df, combined_fc_df)
 
-                    all_cost_cols = list(cost_categories) if has_cost else []
-                    if has_fc:
-                        for c in FC_EXTRA_COST_COLS:
-                            if c in result_df.columns and c not in all_cost_cols:
-                                all_cost_cols.append(c)
-                    result_df = finalize_totals(result_df, all_cost_cols)
+                        all_cost_cols = list(cost_categories) if has_cost else []
+                        if has_fc:
+                            for c in FC_EXTRA_COST_COLS:
+                                if c in result_df.columns and c not in all_cost_cols:
+                                    all_cost_cols.append(c)
+                        result_df = finalize_totals(result_df, all_cost_cols)
 
-                    # Elemző táblák ehhez a hónaphoz
+                    # Elemző táblák ehhez a hónaphoz (körfuvar-only módban csak a
+                    # hibajavításhoz szükségesek készülnek el)
                     tipushiba_df = build_tipushiba_table(result_df, df)
                     osszesito_df = build_osszesito_table(result_df)
-                    relacio_df = build_relacio_table(result_df)
-                    megbizo_df = build_megbizo_table(result_df)
+                    if korfuvar_only:
+                        relacio_df = pd.DataFrame()
+                        megbizo_df = pd.DataFrame()
+                    else:
+                        relacio_df = build_relacio_table(result_df)
+                        megbizo_df = build_megbizo_table(result_df)
                     if not tipushiba_df.empty:
                         _th = tipushiba_df.copy()
                         _th.insert(0, 'Hónap', label)
