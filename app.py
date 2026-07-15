@@ -5,9 +5,11 @@ import pandas as pd
 import streamlit as st
 from openpyxl.styles import PatternFill
 
-APP_VERSION = 'v4.4'
+APP_VERSION = 'v4.5'
 APP_RELEASE_DATE = '2026-07-15'
 APP_CHANGELOG = {
+    'v4.5 (2026-07-15)': 'Feldolgozási animáció: guruló kamion + fázisonként frissülő '
+                         'folyamatjelző a generálás alatt.',
     'v4.4 (2026-07-15)': 'Körfuvar-only mód: ha nincs költség / eredménykimutatás fájl '
                          'feltöltve, csak a körfuvar-generálás és a hibalisták futnak le '
                          '(aggregálás és profit-elemzés kihagyva) — gyorsabb hibajavítási kör.',
@@ -1452,6 +1454,29 @@ GROUP_COLORS = {
     'eredmeny': {'hex': 'FFE699', 'css': 'background-color: #FFE699; color: black'},  # halványsárga
 }
 
+# Feldolgozási animáció: guruló kamion (tiszta CSS, extra függőség nélkül)
+TRUCK_ANIM_HTML = """
+<div class="truck-scene">
+  <div class="truck">🚛</div>
+  <div class="cargo">📦</div>
+  <div class="road"></div>
+</div>
+<style>
+.truck-scene{position:relative;height:78px;overflow:hidden;margin:4px 0 10px 0;}
+.truck{position:absolute;bottom:14px;font-size:44px;line-height:1;
+       animation:drive 3.2s linear infinite;transform:scaleX(-1);}
+.cargo{position:absolute;bottom:22px;font-size:20px;opacity:0;
+       animation:cargo 3.2s linear infinite;}
+.road{position:absolute;bottom:8px;height:5px;width:100%;border-radius:3px;
+      background:repeating-linear-gradient(90deg,#9aa0a6 0 32px,transparent 32px 54px);
+      animation:roadmove .5s linear infinite;}
+@keyframes drive{0%{left:-14%}100%{left:104%}}
+@keyframes cargo{0%,55%{opacity:0;left:60%}60%{opacity:1;left:60%;bottom:22px}
+                 100%{opacity:0;left:60%;bottom:44px}}
+@keyframes roadmove{0%{background-position:0 0}100%{background-position:-54px 0}}
+</style>
+"""
+
 IDENTITY_COLS = [
     'Kör ID', 'Vontatmány', 'Vontatók', 'Megbízók',
     'Reláció', 'Célország', 'Járatszámok',
@@ -1763,15 +1788,28 @@ if uploaded_logbooks:
         if not selected_ym:
             st.error('Válassz ki legalább egy hónapot!')
         else:
-            with st.spinner('Feldolgozás folyamatban...'):
+            with st.container():
+                # --- Feldolgozási animáció + folyamatjelző ---
+                _anim_ph = st.empty()
+                _status_ph = st.empty()
+                _progress = st.progress(0)
+                _anim_ph.markdown(TRUCK_ANIM_HTML, unsafe_allow_html=True)
+
+                def _status(txt, pct):
+                    _status_ph.markdown(f'🛣️ **{txt}**')
+                    _progress.progress(int(min(max(pct, 0), 100)))
+
+                _status('Fuvarnapló elemzése, irányok osztályozása…', 5)
                 df['Irány'] = df.apply(classify_leg_direction, axis=1)
 
                 # Kör-építés EGYSZER, a teljes adathalmazon (a hónap-szűrés csak ezután
                 # jön, így a hónaphatáron átnyúló körök helyesen épülnek fel)
+                _status('Körfuvarok építése és összefűzése…', 15)
                 result_df_all = generate_result_df(df)
                 kor_vege_ser = pd.to_datetime(result_df_all['Kör vége dátum'], errors='coerce')
 
                 # Költség- és eredménykimutatás fájlok beolvasása EGYSZER
+                _status('Költség- és eredménykimutatás fájlok beolvasása…', 35)
                 combined_cost_df, cost_categories = load_all_cost_files(cost_files)
                 has_cost = combined_cost_df is not None and not combined_cost_df.empty
                 if not has_cost:
@@ -1806,7 +1844,10 @@ if uploaded_logbooks:
                 month_results = {}
                 tipushiba_frames = []
 
-                for label in selected_ym:
+                _n_sel = len(selected_ym)
+                for _i_month, label in enumerate(selected_ym, 1):
+                    _status(f'{label} körfuvar-tábla generálása ({_i_month}/{_n_sel})…',
+                            40 + int(50 * (_i_month - 1) / _n_sel))
                     sel_year, sel_month = (int(x) for x in label.split('-'))
                     mask = (kor_vege_ser.dt.year == sel_year) & (kor_vege_ser.dt.month == sel_month)
                     result_df = result_df_all[mask].reset_index(drop=True)
@@ -1880,6 +1921,7 @@ if uploaded_logbooks:
                     tipushiba_all = pd.DataFrame()
 
                 # Opcionális összesítő munkafüzet a legyártott hónapokról
+                _status('Összesítő és letölthető fájlok készítése…', 92)
                 if make_summary and month_results:
                     _labels_sorted = sorted(month_results.keys())
                     _sum_name = (
@@ -1898,6 +1940,15 @@ if uploaded_logbooks:
                     build_havi_osszesito_table(month_results) if month_results else pd.DataFrame()
                 )
                 st.session_state['kf_tipushiba_all'] = tipushiba_all
+
+                # Animáció leszedése + siker jelzés
+                _status('Kész!', 100)
+                _anim_ph.empty()
+                _status_ph.empty()
+                _progress.empty()
+                if outputs:
+                    st.balloons()
+                    st.success(f'✅ Feldolgozás kész: {len(outputs)} fájl legyártva.')
 
     # --- Eredmények megjelenítése (session_state-ből, letöltés után is megmarad) ---
     if st.session_state.get('kf_outputs'):
@@ -1953,17 +2004,21 @@ if uploaded_logbooks:
                     return styles
 
                 _shown = _disp.drop(columns=['Magyarázat_szín'], errors='ignore')
-                _styler = _disp.style.apply(_highlight_cells, axis=1, subset=None)
-                _styler = _styler.hide(axis='columns', subset=['Magyarázat_szín']) \
-                    if 'Magyarázat_szín' in _disp.columns else _styler
-                _header_styles = []
-                for _i, _col in enumerate(list(_shown.columns)):
-                    _g = _group_of_col.get(_col)
-                    if _g:
-                        _header_styles.append({
-                            'selector': f'th.col_heading.level0.col{_i}',
-                            'props': GROUP_COLORS[_g]['css'] + '; font-weight: bold;',
-                        })
-                if _header_styles:
-                    _styler = _styler.set_table_styles(_header_styles, overwrite=False)
-                st.dataframe(_styler, use_container_width=True)
+                try:
+                    _styler = _disp.style.apply(_highlight_cells, axis=1, subset=None)
+                    if 'Magyarázat_szín' in _disp.columns:
+                        _styler = _styler.hide(axis='columns', subset=['Magyarázat_szín'])
+                    _header_styles = []
+                    for _i, _col in enumerate(list(_shown.columns)):
+                        _g = _group_of_col.get(_col)
+                        if _g:
+                            _header_styles.append({
+                                'selector': f'th.col_heading.level0.col{_i}',
+                                'props': GROUP_COLORS[_g]['css'] + '; font-weight: bold;',
+                            })
+                    if _header_styles:
+                        _styler = _styler.set_table_styles(_header_styles, overwrite=False)
+                    st.dataframe(_styler, use_container_width=True)
+                except Exception:
+                    # Fallback: színezés nélküli tábla, ha a Styler nem elérhető
+                    st.dataframe(_shown, use_container_width=True)
