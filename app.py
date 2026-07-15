@@ -1,6 +1,8 @@
-import streamlit as st
-import pandas as pd
 import io
+import re
+
+import pandas as pd
+import streamlit as st
 from openpyxl.styles import PatternFill
 
 st.set_page_config(page_title='Bábolna Körfuvar Generálás', layout='wide')
@@ -17,6 +19,37 @@ COUNTRY_TOLL_CATEGORIES = {
     'Belga', 'Francia', 'Holland', 'Magyar', 'Német',
     'Olasz', 'Osztrák', 'Spanifer', 'Szlovák', 'Szlovén',
 }
+
+# Ismert ország-prefixek a cím-normalizáláshoz (case-insensitive match)
+_CC_RE = re.compile(
+    r'^(HU|AT|DE|FR|IT|NL|BE|ES|SK|SI|PL|CZ|RO|HR|CH|GB|UK|SE|DK|PT|LU|LT|LV|EE|BG|GR|FI|IE|NO)\s',
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Cím-normalizálás (v4.1): HU-felismerés kis/nagybetű és hiányzó prefix ellen védve
+# ---------------------------------------------------------------------------
+def is_hu_address(cim) -> bool:
+    """Egy állomás-cím Magyarországra mutat-e.
+
+    Kezeli a valós adatproblémákat:
+      - 'HU ' / 'Hu ' / 'hu ' prefix (kis/nagybetű érzéketlen)
+      - 'Magyarország 2364 Ócsa ...' formátum
+      - hiányzó országprefix ('2800 Tatabánya ...'): 4 jegyű irányítószámmal
+        kezdődő cím prefix nélkül → HU-nak tekintjük
+      - más országkód prefix ('DE 47829 ...', '90427 Nürnberg' kivétel: 5 jegyű) → nem HU
+    """
+    c = str(cim or '').strip()
+    if re.match(r'^hu\s', c, re.IGNORECASE):
+        return True
+    if c.lower().startswith('magyarország'):
+        return True
+    if _CC_RE.match(c):
+        return False
+    if re.match(r'^\d{4}\s', c):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -42,15 +75,35 @@ def _reszfeladat_of(f_szam):
 # Egy fuvarrészfeladat irányának osztályozása
 # ---------------------------------------------------------------------------
 def classify_leg_direction(row):
-    """Egy részfeladat irányának meghatározása: kifelé / befelé / semleges / ismeretlen."""
+    """Egy részfeladat irányának meghatározása.
+
+    Visszatér: kifelé-nemzetközi / kifelé-belföldi / befelé-nemzetközi /
+               befelé-belföldi / semleges / korfuvar / ismeretlen.
+
+    v4.1: az 'EU körfuvar' típus külön ágat kapott. Egy HU→HU EU körfuvar láb
+    oda-vissza utat ír le egyetlen sorban (tipikusan Bábolna→Bábolna), ezért
+    'korfuvar' irányt kap, ami a kör tartalmában kifelé ÉS befelé szakasznak
+    is számít (önmagában teljes kört ad).
+    """
     fel = str(row['Első Felvételi állomás cím'])
     le = str(row['Utolsó Leadási állomás cím'])
     tipus = str(row['Fuvarfeladat típusa'])
 
-    fel_hu = fel.startswith(HU_PREFIX)
-    le_hu = le.startswith(HU_PREFIX)
+    fel_hu = is_hu_address(fel)
+    le_hu = is_hu_address(le)
     fel_babolna = BABOLNA_KEYWORD in fel
     le_babolna = BABOLNA_KEYWORD in le
+
+    # EU körfuvar – a típus-alapú Export/Import ágak ELŐTT kell vizsgálni
+    tl = tipus.lower()
+    if 'eu' in tl and 'körfuvar' in tl:
+        if fel_hu and le_hu:
+            return 'korfuvar'
+        if fel_hu and not le_hu:
+            return 'kifelé-nemzetközi'
+        if not fel_hu and le_hu:
+            return 'befelé-nemzetközi'
+        return 'semleges'
 
     # Típus-alapú „gyors" osztályozás
     if 'Export' in tipus:
@@ -168,7 +221,7 @@ def _classify_fuvarfeladat_type_expected(tipus_str) -> str:
     Sorrend fontos: 'EU körfuvar' előbb, mert egyben export/import szó is szerepelhet."""
     t = str(tipus_str or '')
     tl = t.lower()
-    if ('eu' in tl) and ('körfuvar' in tl or 'koerfuvar' in tl or 'kör fuvar' in tl or 'körfuvar' in tl):
+    if ('eu' in tl) and ('körfuvar' in tl or 'koerfuvar' in tl or 'kör fuvar' in tl):
         return 'EU_KOR'
     if 'export' in tl:
         return 'EXPORT'
@@ -181,7 +234,11 @@ def _classify_fuvarfeladat_type_expected(tipus_str) -> str:
 
 def validate_torzs_type(torzs: str, torzs_group: pd.DataFrame):
     """Egy fuvarszám-törzsre visszaadja a fuvarfeladat típus validációs hibáit.
-    Visszatér: string lista (üres, ha nincs hiba)."""
+    Visszatér: string lista (üres, ha nincs hiba).
+
+    v4.1: a HU-felismerés az is_hu_address() normalizált logikát használja, így a
+    kisbetűs 'hu' prefix és a hiányzó országprefix nem ad álpozitív hibát.
+    """
     errors = []
     if torzs_group is None or torzs_group.empty:
         return errors
@@ -190,8 +247,8 @@ def validate_torzs_type(torzs: str, torzs_group: pd.DataFrame):
         return errors
     fel_cim = str(row_start.get('Első Felvételi állomás cím', '') or '')
     le_cim = str(row_end.get('Utolsó Leadási állomás cím', '') or '')
-    fel_hu = fel_cim.startswith(HU_PREFIX)
-    le_hu = le_cim.startswith(HU_PREFIX)
+    fel_hu = is_hu_address(fel_cim)
+    le_hu = is_hu_address(le_cim)
     viszonylat = f"{fel_cim}  →  {le_cim}"
     # A típust a törzs első sorából vesszük (feltételezés: a törzsön belül egységes)
     tipus_str = str(row_start.get('Fuvarfeladat típusa', '') or '')
@@ -230,17 +287,25 @@ def _format_leg_step(idx, fsz, jsz, ir, fel_cim, le_cim):
     return f"{idx}. {fsz} ({jsz}, {ir}): {fel_cim}  →  {le_cim}"
 
 
-def _build_kor_content_explanation(legs_ordered):
+def _build_kor_content_explanation(legs_ordered, ures_visszafutas_gyanu=False):
     """A kör tartalma alapján visszaadja a magyarázatot és a színt.
     legs_ordered: [(fuvarszám, járatszám, irány, felvétel_cím, leadás_cím), ...] időrendben.
+
+    v4.1: a 'korfuvar' irányú láb (HU→HU EU körfuvar) kifelé ÉS befelé szakasznak is
+    számít – önmagában teljes kört ad. Kifelé-only körnél az üres visszafutás gyanú
+    külön megjegyzést kap.
     """
-    has_kifele = any(l[2].startswith('kifelé') for l in legs_ordered)
-    has_befele = any(l[2].startswith('befelé') for l in legs_ordered)
+    has_korfuvar = any(l[2] == 'korfuvar' for l in legs_ordered)
+    has_kifele = any(l[2].startswith('kifelé') for l in legs_ordered) or has_korfuvar
+    has_befele = any(l[2].startswith('befelé') for l in legs_ordered) or has_korfuvar
     has_semleges = any(l[2] == 'semleges' for l in legs_ordered)
 
     if has_kifele and has_befele:
-        return ('Teljes kör: kifelé és befelé szakasz is lezárult a körben.',
-                'background-color: lightgreen')
+        msg = 'Teljes kör: kifelé és befelé szakasz is lezárult a körben.'
+        if has_korfuvar:
+            msg = ('Teljes kör: EU körfuvar (oda-vissza) szakaszt tartalmaz, '
+                   'amely önmagában lezárja a kört.')
+        return msg, 'background-color: lightgreen'
 
     # Részletes láncleírás a részleges körhöz
     steps = [_format_leg_step(i, l[0], l[1], l[2], l[3], l[4]) for i, l in enumerate(legs_ordered, 1)]
@@ -260,8 +325,12 @@ def _build_kor_content_explanation(legs_ordered):
         msg = (
             f"Részleges kör: hiányzik a záró import (befelé) fuvar — az utolsó fuvarfeladat "
             f"is export (kifelé) volt: {last[0]} ({last[1]}), viszonylat: {last[3]}  →  {last[4]}. "
-            f"A körben csak export típusú járatok vannak. Lánc: {lanc}"
+            f"A körben csak export típusú járatok vannak."
         )
+        if ures_visszafutas_gyanu:
+            msg += (" A vontatmány következő fuvarfeladata is kifelé irányú → "
+                    "valószínű üres visszafutás (nincs rögzített import a visszaútra).")
+        msg += f" Lánc: {lanc}"
         return msg, 'background-color: orange'
 
     if has_kifele and has_semleges and not has_befele:
@@ -304,7 +373,7 @@ def _build_vontatmany_change_explanation(torzs: str, torzs_history: list):
         cur = torzs_history[i]
         if str(cur.get('vontatmány', '')) != str(prev.get('vontatmány', '')):
             return (
-                f"Változó vontatmány hiba – a {torzs} fuvarszám törzs több vontatmányon fut. "
+                f"a {torzs} fuvarszám törzs több vontatmányon fut. "
                 f"A(z) {prev.get('fuvarszám','?')} feladat (járat {prev.get('járatszám','?')}) "
                 f"a(z) '{prev.get('vontatmány','?')}' vontatmánnyal indult, majd a következő "
                 f"{cur.get('fuvarszám','?')} feladatnál (járat {cur.get('járatszám','?')}) "
@@ -312,30 +381,44 @@ def _build_vontatmany_change_explanation(torzs: str, torzs_history: list):
                 f"Érintett vontatmányok összesen: {', '.join(egyedi_v)}."
             )
     return (
-        f"Változó vontatmány hiba – a {torzs} fuvarszám törzs több vontatmányon fut: "
+        f"a {torzs} fuvarszám törzs több vontatmányon fut: "
         f"{', '.join(egyedi_v)}."
     )
 
 
-def build_full_kor_explanation(legs_ordered, torzsek_a_korben, torzs_history_map, torzs_group_map):
+def build_full_kor_explanation(legs_ordered, torzsek_a_korben, torzs_history_map,
+                               torzs_group_map, ures_visszafutas_gyanu=False):
     """Összeállítja a kör teljes magyarázatát több szempont figyelembevételével:
-      1) Vontatmány váltás minden érintett törzsre (részletes)
+      1) Vontatmány váltás minden érintett törzsre
+         v4.1: ha a törzs MINDEN részfeladata ebben a körben van (a törzs-alapú
+         kör-összefűzés után ez a normál eset), a vontatmány-váltás elő-fuvar /
+         pótkocsi-csere INFÓ, nem hiba. Csak akkor piros, ha a törzs tényleg
+         több körre esett szét.
       2) Fuvarfeladat típus validáció minden érintett törzsre
       3) A kör tartalma (teljes / részleges) – részletes láncleírással
-    Ha van bármilyen hiba, a szín NARANCS (kivéve, ha vontatmány hiba is van – akkor PIROS).
-    Ha nincs hiba és teljes kör → ZÖLD.
+    Szín prioritás: szétesett törzs (piros) > típus/tartalmi hiba (narancs) > zöld.
     """
     parts = []
     has_vontatmany_hiba = False
     has_tipus_hiba = False
+
+    kor_fuvarszamok = {l[0] for l in legs_ordered}
 
     # 1) Vontatmány váltás
     for torzs in torzsek_a_korben:
         history = torzs_history_map.get(torzs, [])
         msg = _build_vontatmany_change_explanation(torzs, history)
         if msg:
-            parts.append(msg)
-            has_vontatmany_hiba = True
+            torzs_all_in = all(str(h.get('fuvarszám')) in kor_fuvarszamok for h in history)
+            if torzs_all_in:
+                parts.append(
+                    'ℹ️ Elő-fuvar / pótkocsi-csere (nem hiba): ' + msg +
+                    ' A törzs összes részfeladata ebben a körben van.'
+                )
+            else:
+                parts.append('Változó vontatmány hiba – ' + msg +
+                             ' A törzs részfeladatai több körre estek szét.')
+                has_vontatmany_hiba = True
 
     # 2) Fuvarfeladat típus validáció
     for torzs in torzsek_a_korben:
@@ -348,12 +431,13 @@ def build_full_kor_explanation(legs_ordered, torzsek_a_korben, torzs_history_map
             has_tipus_hiba = True
 
     # 3) Kör tartalom
-    content_msg, content_color = _build_kor_content_explanation(legs_ordered)
+    content_msg, content_color = _build_kor_content_explanation(
+        legs_ordered, ures_visszafutas_gyanu=ures_visszafutas_gyanu)
     parts.append(content_msg)
 
     combined = '  ///  '.join(parts)
 
-    # Szín prioritás: vontatmány > tartalmi hiba > tartalom szerinti
+    # Szín prioritás: szétesett törzs > típus hiba > tartalom szerinti
     if has_vontatmany_hiba:
         color = 'background-color: lightcoral'
     elif has_tipus_hiba:
@@ -362,6 +446,287 @@ def build_full_kor_explanation(legs_ordered, torzsek_a_korben, torzs_history_map
         color = content_color
 
     return combined, color
+
+
+# ---------------------------------------------------------------------------
+# Kör-építés + törzs-alapú kör-összefűzés (v4.1)
+# ---------------------------------------------------------------------------
+def build_korfuvarok(df: pd.DataFrame):
+    """Körök építése vontatmányonként, majd a közös fuvarszám-törzsön osztozó
+    körök összefűzése (union-find).
+
+    Az elő-fuvar minta miatt (a -1 belföldi felfutás shuttle vontatmánnyal megy a
+    bábolnai hubra, a -2 nemzetközi láb a vonali vontatmánnyal) egy törzs lábai
+    különböző vontatmány-csoportokba kerülhetnek. Az összefűzés ezeket egyetlen
+    körré egyesíti, így a törzs sosem esik több körre.
+
+    Visszatér: [(kor_id, vontatmany_label, legs_list), ...]
+    """
+    korfuvarok = []
+    global_kor_id = 0
+
+    for vontatmany, grp in df.groupby('Vontatmány'):
+        grp_sorted = grp.sort_values([
+            'Utolsó Leadási állomás időkapu (dátum)',
+            'Első Felvételi állomás időkapu (dátum)',
+        ])
+
+        current_kor_legs = []
+        current_fuv_torzsek = set()
+        current_jaratszamok = set()
+
+        for _, row in grp_sorted.iterrows():
+            f_szam = str(row['Fuvarszám'])
+            j_szam = str(row['Járatszám'])
+            f_torzs = _torzs_of(f_szam)
+            irany = row['Irány']
+
+            if not current_kor_legs:
+                global_kor_id += 1
+                current_kor_legs = [row]
+                current_fuv_torzsek = {f_torzs}
+                current_jaratszamok = {j_szam}
+                continue
+
+            prev_irany = current_kor_legs[-1]['Irány']
+
+            kapcsolodik_szam = (
+                f_torzs in current_fuv_torzsek or j_szam in current_jaratszamok
+            )
+
+            irany_osszetartozo = False
+            if prev_irany.startswith('kifelé') and irany in (
+                    'semleges', 'befelé-nemzetközi', 'befelé-belföldi', 'korfuvar'):
+                irany_osszetartozo = True
+            if prev_irany == 'semleges' and irany in (
+                    'semleges', 'befelé-nemzetközi', 'befelé-belföldi', 'korfuvar'):
+                irany_osszetartozo = True
+
+            if kapcsolodik_szam or irany_osszetartozo:
+                current_kor_legs.append(row)
+                current_fuv_torzsek.add(f_torzs)
+                current_jaratszamok.add(j_szam)
+                continue
+
+            korfuvarok.append((global_kor_id, vontatmany, current_kor_legs))
+            global_kor_id += 1
+            current_kor_legs = [row]
+            current_fuv_torzsek = {f_torzs}
+            current_jaratszamok = {j_szam}
+
+        if current_kor_legs:
+            korfuvarok.append((global_kor_id, vontatmany, current_kor_legs))
+
+    # --- Körök összefűzése: közös fuvarszám-törzsön osztozó körök egyesítése ---
+    ring_torzsek = [
+        {_torzs_of(str(r['Fuvarszám'])) for r in legs}
+        for _, _, legs in korfuvarok
+    ]
+    parent = list(range(len(korfuvarok)))
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    torzs_to_ring = {}
+    for i, ts in enumerate(ring_torzsek):
+        for t in ts:
+            if t in torzs_to_ring:
+                ra, rb = _find(torzs_to_ring[t]), _find(i)
+                if ra != rb:
+                    parent[rb] = ra
+            else:
+                torzs_to_ring[t] = i
+
+    merged = {}
+    for i in range(len(korfuvarok)):
+        merged.setdefault(_find(i), []).append(korfuvarok[i])
+
+    korfuvarok_merged = []
+    for grp in merged.values():
+        all_legs = [r for _, _, legs in grp for r in legs]
+        vontok = ' + '.join(sorted({str(v) for _, v, _ in grp}))
+        korfuvarok_merged.append((grp[0][0], vontok, all_legs))
+
+    # Kör ID-k újraszámozása determinisztikus sorrendben (első láb felvételi ideje)
+    def _first_pickup(item):
+        dts = [r['Első Felvételi állomás időkapu (dátum)'] for r in item[2]
+               if pd.notna(r['Első Felvételi állomás időkapu (dátum)'])]
+        return min(dts) if dts else pd.Timestamp.max
+
+    korfuvarok_merged.sort(key=_first_pickup)
+    return [(i + 1, vont, legs) for i, (_, vont, legs) in enumerate(korfuvarok_merged)]
+
+
+def detect_ures_visszafutas(df: pd.DataFrame, legs_df: pd.DataFrame, kor_veg) -> bool:
+    """Kifelé-only körnél: a kör vontatmányán a kör vége UTÁNI következő láb
+    megint kifelé irányú-e (→ valószínű üres visszafutás)."""
+    if pd.isna(kor_veg):
+        return False
+    vontok = set(legs_df['Vontatmány'].astype(str))
+    after = df[
+        df['Vontatmány'].astype(str).isin(vontok)
+        & (df['Utolsó Leadási állomás időkapu (dátum)'] > kor_veg)
+    ]
+    if after.empty:
+        return False
+    nxt = after.sort_values('Utolsó Leadási állomás időkapu (dátum)').iloc[0]
+    return str(nxt['Irány']).startswith('kifelé')
+
+
+def generate_result_df(df: pd.DataFrame) -> pd.DataFrame:
+    """A teljes kör-generálási pipeline a fuvarnaplóból (hónap-szűrés NÉLKÜL).
+
+    Elvárás: a df-ben az időkapu oszlopok datetime-ok és az 'Irány' oszlop kitöltött.
+    """
+    # Előindexelés törzsenként (vontatmány-váltás leíráshoz és típus-validációhoz)
+    tmp_torzs = df['Fuvarszám'].astype(str).map(_torzs_of)
+    df_indexed = df.assign(_torzs=tmp_torzs)
+
+    torzs_history_map = {}
+    for torzs, grp in df_indexed.groupby('_torzs'):
+        grp = grp.copy()
+        grp['_reszfeladat'] = grp['Fuvarszám'].map(_reszfeladat_of)
+        if grp['_reszfeladat'].notna().any():
+            grp = grp.sort_values(
+                ['_reszfeladat', 'Első Felvételi állomás időkapu (dátum)'],
+                na_position='last',
+            )
+        else:
+            grp = grp.sort_values('Első Felvételi állomás időkapu (dátum)')
+        torzs_history_map[torzs] = [
+            {
+                'fuvarszám': str(r['Fuvarszám']),
+                'járatszám': str(r['Járatszám']),
+                'vontatmány': str(r['Vontatmány']),
+            }
+            for _, r in grp.iterrows()
+        ]
+
+    torzs_group_map = {
+        torzs: grp.drop(columns=['_torzs'], errors='ignore')
+        for torzs, grp in df_indexed.groupby('_torzs')
+    }
+
+    korfuvarok = build_korfuvarok(df)
+
+    output_rows = []
+    for kor_id, vontatmany, legs in korfuvarok:
+        legs_df = pd.DataFrame(legs)
+
+        total_dij = legs_df['Díj részarány (EUR)'].sum() if 'Díj részarány (EUR)' in legs_df.columns else 0
+
+        all_vontatok = ' | '.join(
+            legs_df['Vontató'].astype(str).dropna().unique().tolist()
+        )
+        jaratszamok_lista = (
+            legs_df['Járatszám'].astype(str).str.strip().dropna().unique().tolist()
+        )
+        all_jaratszamok = ' | '.join(jaratszamok_lista)
+
+        kifele_legs = legs_df[legs_df['Irány'].str.startswith('kifelé')]
+        befele_legs = legs_df[legs_df['Irány'].str.startswith('befelé')]
+        semleges_legs = legs_df[legs_df['Irány'] == 'semleges']
+        korfuvar_legs = legs_df[legs_df['Irány'] == 'korfuvar']
+
+        kif_kezd_ido, kif_kezd_cim, kif_zar_ido, kif_zar_cim = get_interval_with_addresses(kifele_legs)
+        sem_kezd_ido, sem_kezd_cim, sem_zar_ido, sem_zar_cim = get_interval_with_addresses(semleges_legs)
+        bef_kezd_ido, bef_kezd_cim, bef_zar_ido, bef_zar_cim = get_interval_with_addresses(befele_legs)
+        krf_kezd_ido, _krf_kezd_cim, krf_zar_ido, _krf_zar_cim = get_interval_with_addresses(korfuvar_legs)
+
+        has_korfuvar = not korfuvar_legs.empty
+        has_kifele = (not kifele_legs.empty) or has_korfuvar
+        has_befele = (not befele_legs.empty) or has_korfuvar
+        has_semleges = not semleges_legs.empty
+
+        # Kör kezdete: kifelé → korfuvar → semleges → befelé (fallback lánc)
+        kor_kezd = kif_kezd_ido
+        for cand in (krf_kezd_ido, sem_kezd_ido, bef_kezd_ido):
+            if pd.isna(kor_kezd):
+                kor_kezd = cand
+        # Kör vége: befelé → korfuvar → semleges → kifelé
+        kor_veg = bef_zar_ido
+        for cand in (krf_zar_ido, sem_zar_ido, kif_zar_ido):
+            if pd.isna(kor_veg):
+                kor_veg = cand
+
+        # Időrendben rendezett részfeladat lista a magyarázathoz
+        legs_sorted_for_expl = legs_df.sort_values([
+            'Első Felvételi állomás időkapu (dátum)',
+            'Utolsó Leadási állomás időkapu (dátum)',
+        ], na_position='last')
+        legs_ordered_tuples = [
+            (
+                str(r['Fuvarszám']),
+                str(r['Járatszám']),
+                str(r['Irány']),
+                str(r.get('Első Felvételi állomás cím', '') or ''),
+                str(r.get('Utolsó Leadási állomás cím', '') or ''),
+            )
+            for _, r in legs_sorted_for_expl.iterrows()
+        ]
+
+        # Üres visszafutás gyanú (csak kifelé-only körnél érdekes)
+        ures_gyanu = False
+        if has_kifele and not has_befele:
+            ures_gyanu = detect_ures_visszafutas(df, legs_df, kor_veg)
+
+        row = {
+            'Kör ID': kor_id,
+            'Vontatmány': vontatmany,
+            'Vontatók': all_vontatok,
+            'Járatszámok': all_jaratszamok,
+            'Kör kezdete dátum': kor_kezd,
+            'Kör vége dátum': kor_veg,
+            'Kifelé kezdő időkapu': kif_kezd_ido,
+            'Kifelé kezdő cím': kif_kezd_cim,
+            'Kifelé záró időkapu': kif_zar_ido,
+            'Kifelé záró cím': kif_zar_cim,
+            'Nemzetközi (semleges) kezdő időkapu': sem_kezd_ido,
+            'Nemzetközi (semleges) kezdő cím': sem_kezd_cim,
+            'Nemzetközi (semleges) záró időkapu': sem_zar_ido,
+            'Nemzetközi (semleges) záró cím': sem_zar_cim,
+            'Befelé kezdő időkapu': bef_kezd_ido,
+            'Befelé kezdő cím': bef_kezd_cim,
+            'Befelé záró időkapu': bef_zar_ido,
+            'Befelé záró cím': bef_zar_cim,
+            'Részfeladatok száma': len(legs_df),
+            'Fuvarszámok': ', '.join(legs_df['Fuvarszám'].astype(str).tolist()),
+            'Összes díj részarány (EUR)': total_dij,
+            'Deviza': 'EUR',
+            '_Has_kifele': has_kifele,
+            '_Has_befele': has_befele,
+            '_Has_semleges': has_semleges,
+            '_Has_korfuvar': has_korfuvar,
+            '_Ures_visszafutas_gyanu': ures_gyanu,
+            '_Korben_Fuvarszam_lista': legs_df['Fuvarszám'].astype(str).tolist(),
+            '_Korben_Jaratszam_lista': jaratszamok_lista,
+            '_Kor_Legs_Ordered': legs_ordered_tuples,
+        }
+        output_rows.append(row)
+
+    result_df_all = pd.DataFrame(output_rows)
+
+    # Magyarázat + szín (részletes: vontatmány / típus / tartalom)
+    magy = []
+    szin = []
+    for _, row in result_df_all.iterrows():
+        legs_ordered = row.get('_Kor_Legs_Ordered') or []
+        torzsek_a_korben = list(dict.fromkeys(_torzs_of(f) for f in row['_Korben_Fuvarszam_lista']))
+        exp, color = build_full_kor_explanation(
+            legs_ordered=legs_ordered,
+            torzsek_a_korben=torzsek_a_korben,
+            torzs_history_map=torzs_history_map,
+            torzs_group_map=torzs_group_map,
+            ures_visszafutas_gyanu=bool(row.get('_Ures_visszafutas_gyanu')),
+        )
+        magy.append(exp)
+        szin.append(color)
+    result_df_all['Magyarázat'] = magy
+    result_df_all['Magyarázat_szín'] = szin
+    return result_df_all
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +836,7 @@ def parse_flight_controlling_file(uploaded_file):
 
 
 def load_all_flight_controlling_files(uploaded_files):
-    """Több flight controlling fájl beolvasása + dedup Järatszám alapján (keep='first')."""
+    """Több flight controlling fájl beolvasása + dedup Járatszám alapján (keep='first')."""
     if not uploaded_files:
         return None
     dfs = []
@@ -746,6 +1111,26 @@ if uploaded_file is not None:
     df['Első Felvételi állomás időkapu (dátum)'] = pd.to_datetime(
         df['Első Felvételi állomás időkapu (dátum)'], errors='coerce')
 
+    # Dátum-anomália ellenőrzés: leadás < felvétel (adatrögzítési hiba, a
+    # kör-építés rendezését keverheti)
+    _anomalia_mask = (
+        df['Utolsó Leadási állomás időkapu (dátum)'].notna()
+        & df['Első Felvételi állomás időkapu (dátum)'].notna()
+        & (df['Utolsó Leadási állomás időkapu (dátum)']
+           < df['Első Felvételi állomás időkapu (dátum)'])
+    )
+    if _anomalia_mask.any():
+        st.warning(
+            f'⚠️ {int(_anomalia_mask.sum())} sorban a leadási időkapu KORÁBBI, mint a '
+            f'felvételi (adatrögzítési hiba gyanú). Ezek a kör-építés sorrendjét torzíthatják.'
+        )
+        with st.expander('Dátum-anomáliás sorok megtekintése'):
+            st.dataframe(df.loc[_anomalia_mask, [
+                'Fuvarszám', 'Járatszám', 'Vontatmány',
+                'Első Felvételi állomás időkapu (dátum)',
+                'Utolsó Leadási állomás időkapu (dátum)',
+            ]], use_container_width=True)
+
     available_years = sorted(df['Utolsó Leadási állomás időkapu (dátum)'].dt.year.dropna().unique())
 
     col1, col2 = st.columns(2)
@@ -762,204 +1147,34 @@ if uploaded_file is not None:
         with st.spinner('Feldolgozás folyamatban...'):
             df['Irány'] = df.apply(classify_leg_direction, axis=1)
 
-            # Előindexelés: törzsenként hány egyedi vontatmány van (változó vontatmány ellenőrzéshez)
-            tmp_torzs = df['Fuvarszám'].astype(str).map(_torzs_of)
-            df_indexed = df.assign(_torzs=tmp_torzs)
-            torzs_vontatmany_count = (
-                df_indexed.groupby('_torzs')['Vontatmány'].nunique().to_dict()
-            )
-
-            # Törzs → sorrendezett részfeladat-lista (részfeladat # / idő szerint),
-            # a vontatmány-változás pontos leírásához
-            torzs_history_map = {}
-            for torzs, grp in df_indexed.groupby('_torzs'):
-                grp = grp.copy()
-                grp['_reszfeladat'] = grp['Fuvarszám'].map(_reszfeladat_of)
-                if grp['_reszfeladat'].notna().any():
-                    grp = grp.sort_values(
-                        ['_reszfeladat', 'Első Felvételi állomás időkapu (dátum)'],
-                        na_position='last',
-                    )
-                else:
-                    grp = grp.sort_values('Első Felvételi állomás időkapu (dátum)')
-                torzs_history_map[torzs] = [
-                    {
-                        'fuvarszám': str(r['Fuvarszám']),
-                        'járatszám': str(r['Járatszám']),
-                        'vontatmány': str(r['Vontatmány']),
-                    }
-                    for _, r in grp.iterrows()
-                ]
-
-            # Törzs → teljes DataFrame csoport, a fuvarfeladat-típus validációhoz
-            torzs_group_map = {
-                torzs: grp.drop(columns=['_torzs'], errors='ignore')
-                for torzs, grp in df_indexed.groupby('_torzs')
-            }
-
-            korfuvarok = []
-            global_kor_id = 0
-
-            # Körépítés vontatmányonként, idő szerint rendezve
-            for vontatmany, grp in df.groupby('Vontatmány'):
-                grp_sorted = grp.sort_values([
-                    'Utolsó Leadási állomás időkapu (dátum)',
-                    'Első Felvételi állomás időkapu (dátum)',
-                ])
-
-                current_kor_legs = []
-                current_fuv_torzsek = set()
-                current_jaratszamok = set()
-
-                for _, row in grp_sorted.iterrows():
-                    f_szam = str(row['Fuvarszám'])
-                    j_szam = str(row['Járatszám'])
-                    f_torzs = _torzs_of(f_szam)
-                    irany = row['Irány']
-
-                    if not current_kor_legs:
-                        global_kor_id += 1
-                        current_kor_legs = [row]
-                        current_fuv_torzsek = {f_torzs}
-                        current_jaratszamok = {j_szam}
-                        continue
-
-                    prev_irany = current_kor_legs[-1]['Irány']
-
-                    kapcsolodik_szam = (
-                        f_torzs in current_fuv_torzsek or j_szam in current_jaratszamok
-                    )
-
-                    irany_osszetartozo = False
-                    if prev_irany.startswith('kifelé') and irany in (
-                            'semleges', 'befelé-nemzetközi', 'befelé-belföldi'):
-                        irany_osszetartozo = True
-                    if prev_irany == 'semleges' and irany in (
-                            'semleges', 'befelé-nemzetközi', 'befelé-belföldi'):
-                        irany_osszetartozo = True
-
-                    if kapcsolodik_szam or irany_osszetartozo:
-                        current_kor_legs.append(row)
-                        current_fuv_torzsek.add(f_torzs)
-                        current_jaratszamok.add(j_szam)
-                        continue
-
-                    korfuvarok.append((global_kor_id, vontatmany, current_kor_legs))
-                    global_kor_id += 1
-                    current_kor_legs = [row]
-                    current_fuv_torzsek = {f_torzs}
-                    current_jaratszamok = {j_szam}
-
-                if current_kor_legs:
-                    korfuvarok.append((global_kor_id, vontatmany, current_kor_legs))
-
-            # Kör sorok összeállítása
-            output_rows = []
-            for kor_id, vontatmany, legs in korfuvarok:
-                legs_df = pd.DataFrame(legs)
-
-                total_dij = legs_df['Díj részarány (EUR)'].sum() if 'Díj részarány (EUR)' in legs_df.columns else 0
-
-                all_vontatok = ' | '.join(
-                    legs_df['Vontató'].astype(str).dropna().unique().tolist()
-                )
-                jaratszamok_lista = (
-                    legs_df['Járatszám'].astype(str).str.strip().dropna().unique().tolist()
-                )
-                all_jaratszamok = ' | '.join(jaratszamok_lista)
-
-                kifele_legs = legs_df[legs_df['Irány'].str.startswith('kifelé')]
-                befele_legs = legs_df[legs_df['Irány'].str.startswith('befelé')]
-                semleges_legs = legs_df[legs_df['Irány'] == 'semleges']
-
-                kif_kezd_ido, kif_kezd_cim, kif_zar_ido, kif_zar_cim = get_interval_with_addresses(kifele_legs)
-                sem_kezd_ido, sem_kezd_cim, sem_zar_ido, sem_zar_cim = get_interval_with_addresses(semleges_legs)
-                bef_kezd_ido, bef_kezd_cim, bef_zar_ido, bef_zar_cim = get_interval_with_addresses(befele_legs)
-
-                has_kifele = not kifele_legs.empty
-                has_befele = not befele_legs.empty
-                has_semleges = not semleges_legs.empty
-
-                kor_kezd = (
-                    kif_kezd_ido if pd.notna(kif_kezd_ido)
-                    else (sem_kezd_ido if pd.notna(sem_kezd_ido) else bef_kezd_ido)
-                )
-                kor_veg = (
-                    bef_zar_ido if pd.notna(bef_zar_ido)
-                    else (sem_zar_ido if pd.notna(sem_zar_ido) else kif_zar_ido)
-                )
-
-                # Időrendben rendezett részfeladat lista a magyarázathoz
-                legs_sorted_for_expl = legs_df.sort_values([
-                    'Első Felvételi állomás időkapu (dátum)',
-                    'Utolsó Leadási állomás időkapu (dátum)',
-                ], na_position='last')
-                legs_ordered_tuples = [
-                    (
-                        str(r['Fuvarszám']),
-                        str(r['Járatszám']),
-                        str(r['Irány']),
-                        str(r.get('Első Felvételi állomás cím', '') or ''),
-                        str(r.get('Utolsó Leadási állomás cím', '') or ''),
-                    )
-                    for _, r in legs_sorted_for_expl.iterrows()
-                ]
-
-                row = {
-                    'Kör ID': kor_id,
-                    'Vontatmány': vontatmany,
-                    'Vontatók': all_vontatok,
-                    'Járatszámok': all_jaratszamok,
-                    'Kör kezdete dátum': kor_kezd,
-                    'Kör vége dátum': kor_veg,
-                    'Kifelé kezdő időkapu': kif_kezd_ido,
-                    'Kifelé kezdő cím': kif_kezd_cim,
-                    'Kifelé záró időkapu': kif_zar_ido,
-                    'Kifelé záró cím': kif_zar_cim,
-                    'Nemzetközi (semleges) kezdő időkapu': sem_kezd_ido,
-                    'Nemzetközi (semleges) kezdő cím': sem_kezd_cim,
-                    'Nemzetközi (semleges) záró időkapu': sem_zar_ido,
-                    'Nemzetközi (semleges) záró cím': sem_zar_cim,
-                    'Befelé kezdő időkapu': bef_kezd_ido,
-                    'Befelé kezdő cím': bef_kezd_cim,
-                    'Befelé záró időkapu': bef_zar_ido,
-                    'Befelé záró cím': bef_zar_cim,
-                    'Részfeladatok száma': len(legs_df),
-                    'Fuvarszámok': ', '.join(legs_df['Fuvarszám'].astype(str).tolist()),
-                    'Összes díj részarány (EUR)': total_dij,
-                    'Deviza': 'EUR',
-                    '_Has_kifele': has_kifele,
-                    '_Has_befele': has_befele,
-                    '_Has_semleges': has_semleges,
-                    '_Korben_Fuvarszam_lista': legs_df['Fuvarszám'].astype(str).tolist(),
-                    '_Korben_Jaratszam_lista': jaratszamok_lista,
-                    '_Kor_Legs_Ordered': legs_ordered_tuples,
-                }
-                output_rows.append(row)
-
-            result_df_all = pd.DataFrame(output_rows)
-
-            # Magyarázat + szín (részletes: vontatmány / típus / tartalom)
-            magy = []
-            szin = []
-            for _, row in result_df_all.iterrows():
-                legs_ordered = row.get('_Kor_Legs_Ordered') or []
-                torzsek_a_korben = list(dict.fromkeys(_torzs_of(f) for f in row['_Korben_Fuvarszam_lista']))
-                exp, color = build_full_kor_explanation(
-                    legs_ordered=legs_ordered,
-                    torzsek_a_korben=torzsek_a_korben,
-                    torzs_history_map=torzs_history_map,
-                    torzs_group_map=torzs_group_map,
-                )
-                magy.append(exp)
-                szin.append(color)
-            result_df_all['Magyarázat'] = magy
-            result_df_all['Magyarázat_szín'] = szin
+            result_df_all = generate_result_df(df)
 
             # Szűrés kiválasztott évre/hónapra a Kör vége alapján
             kor_vege_ser = pd.to_datetime(result_df_all['Kör vége dátum'], errors='coerce')
             mask = (kor_vege_ser.dt.year == selected_year) & (kor_vege_ser.dt.month == selected_month)
             result_df = result_df_all[mask].reset_index(drop=True)
+
+            # Valódi típushibák külön listában a controllingnak
+            tipus_hibak = []
+            _torzs_group_map_ui = {
+                t: g for t, g in df.assign(
+                    _torzs=df['Fuvarszám'].astype(str).map(_torzs_of)
+                ).groupby('_torzs')
+            }
+            _seen_torzs = set()
+            for _, r in result_df.iterrows():
+                for f in (r.get('_Korben_Fuvarszam_lista') or []):
+                    t = _torzs_of(f)
+                    if t in _seen_torzs:
+                        continue
+                    _seen_torzs.add(t)
+                    tipus_hibak.extend(validate_torzs_type(t, _torzs_group_map_ui.get(t)))
+            if tipus_hibak:
+                with st.expander(
+                        f'📋 Fuvarfeladat típus hibák a kiválasztott hónapban '
+                        f'({len(tipus_hibak)} db) – javítandó a forrásrendszerben'):
+                    for e in tipus_hibak:
+                        st.markdown(f'- {e}')
 
             # --- Kategóriás költség táblák ---
             combined_cost_df, cost_categories = load_all_cost_files(cost_files)
@@ -1042,7 +1257,8 @@ if uploaded_file is not None:
             ordered_cols.extend(eredmeny_cols)
 
             # Belső oszlopokat megtartjuk a Styler-nek, de a megjelenítéshez nem hozzuk
-            internal_cols = ['_Has_kifele', '_Has_befele', '_Has_semleges',
+            internal_cols = ['_Has_kifele', '_Has_befele', '_Has_semleges', '_Has_korfuvar',
+                             '_Ures_visszafutas_gyanu',
                              '_Korben_Fuvarszam_lista', '_Korben_Jaratszam_lista',
                              '_Kor_Legs_Ordered',
                              '_cost_any_match', '_fc_any_match']
@@ -1081,11 +1297,6 @@ if uploaded_file is not None:
                             styles.append('')
                     else:
                         styles.append('')
-                return styles
-
-            # Csoport-szintű fejléc színezés a Streamlit-ben
-            def style_columns_header(df_shown):
-                styles = pd.DataFrame('', index=df_shown.index, columns=df_shown.columns)
                 return styles
 
             st.subheader('Generált körfuvarok (kiválasztott hónap szerint)')
