@@ -5,9 +5,14 @@ import pandas as pd
 import streamlit as st
 from openpyxl.styles import PatternFill
 
-APP_VERSION = 'v4.5'
-APP_RELEASE_DATE = '2026-07-15'
+APP_VERSION = 'v4.6'
+APP_RELEASE_DATE = '2026-07-17'
 APP_CHANGELOG = {
+    'v4.6 (2026-07-17)': 'Időszak után záródó körök felismerése: ha a kör / a hiányzó '
+                         'nemzetközi részfeladat a feltöltött adatablak utolsó napjaira esik, '
+                         'az nem rögzítési hiba, hanem a kör a következő időszakban fejeződik '
+                         'be → kék info jelölés, és kizárás a pénzügyi kimutatásokból '
+                         '(Összesítő, Ország-relációk, Megbízók, szumma sor).',
     'v4.5 (2026-07-15)': 'Feldolgozási animáció: guruló kamion + fázisonként frissülő '
                          'folyamatjelző a generálás alatt.',
     'v4.4 (2026-07-15)': 'Körfuvar-only mód: ha nincs költség / eredménykimutatás fájl '
@@ -34,6 +39,13 @@ st.markdown('---')
 
 HU_PREFIX = 'HU '
 BABOLNA_KEYWORD = 'Bábolna Rákóczi utca'
+
+# Időszak-vég (adatablak-csonkolás) felismerés: ha egy félbeszakadtnak tűnő kör
+# (nincs záró import) vagy egy hiányzó nemzetközi részfeladatú törzs utolsó
+# aktivitása a feltöltött adatok legutolsó leadási dátumához képest ennyi napon
+# belül van, akkor azt NEM hibaként, hanem "időszak után záródó kör (valószínű)"
+# kategóriaként kezeljük (kék jelölés), és kizárjuk a pénzügyi kimutatásokból.
+WINDOW_TRUNCATION_DAYS = 7
 
 # Az első költség fájl ország-alapú kategóriái == a Flight Controlling fájl 'Útdíj költség'
 # járatonkénti bontása. Ha az FC 'Útdíj költség' oszlop is jelen van, a szummában csak
@@ -267,7 +279,7 @@ def _classify_fuvarfeladat_type_expected(tipus_str) -> str:
     return 'ISMERETLEN'
 
 
-def analyze_torzs_type(torzs: str, torzs_group: pd.DataFrame):
+def analyze_torzs_type(torzs: str, torzs_group: pd.DataFrame, window_end=None):
     """Komplex fuvarfeladat típus + állomás-típus validáció egy törzsre.
 
     A törzs ÖSSZES részfeladatát vizsgálja (részfeladat-sorszám szerinti sorrendben),
@@ -321,7 +333,7 @@ def analyze_torzs_type(torzs: str, torzs_group: pd.DataFrame):
     tipus_str = str(grp.iloc[0].get('Fuvarfeladat típusa', '') or '')
     expected = _classify_fuvarfeladat_type_expected(tipus_str)
 
-    def _res(hiba, javaslat, implies_complete=False):
+    def _res(hiba, javaslat, implies_complete=False, window_truncated=False):
         return {
             'torzs': torzs,
             'tipus': tipus_str,
@@ -331,7 +343,34 @@ def analyze_torzs_type(torzs: str, torzs_group: pd.DataFrame):
             'hiba': hiba,
             'javaslat': javaslat,
             'implies_complete': implies_complete,
+            'window_truncated': window_truncated,
         }
+
+    # A törzs utolsó aktivitása + időszak-vég közelség (v4.6): ha a törzs a
+    # feltöltött adatablak utolsó napjaiban szakad félbe, a hiányzó nemzetközi /
+    # hazatérő részfeladat valószínűleg az időszak UTÁN van → nem hiba.
+    _dates = []
+    for _c in ('Első Felvételi állomás időkapu (dátum)',
+               'Utolsó Leadási állomás időkapu (dátum)'):
+        if _c in grp.columns:
+            _dates.extend(pd.to_datetime(grp[_c], errors='coerce').dropna().tolist())
+    last_activity = max(_dates) if _dates else None
+    near_window_end = (
+        window_end is not None and pd.notna(window_end)
+        and last_activity is not None
+        and (pd.Timestamp(window_end) - pd.Timestamp(last_activity)).days
+        <= WINDOW_TRUNCATION_DAYS
+    )
+
+    def _truncated_res(reszlet):
+        return _res(
+            f"{reszlet} A törzs utolsó aktivitása ({last_activity:%Y-%m-%d}) a feltöltött "
+            f"adatablak utolsó napjaira esik (ablak vége: {pd.Timestamp(window_end):%Y-%m-%d}) "
+            f"— a kör valószínűleg a lekérdezett időszak UTÁN fejeződik be. Ez nem rögzítési hiba.",
+            "Futtasd újra a következő időszak fuvarnaplójával együtt, akkor a kör teljes lesz. "
+            "Addig a kör a pénzügyi kimutatásokból kizárva.",
+            window_truncated=True,
+        )
 
     # Közbenső mintázatok
     max_dij = max(l['dij'] for l in legs)
@@ -381,6 +420,10 @@ def analyze_torzs_type(torzs: str, torzs_group: pd.DataFrame):
                     "külföldi állomás típusa lerakóról felrakóra javítandó.",
                     implies_complete=True,
                 )
+            if near_window_end:
+                return _truncated_res(
+                    "A törzs minden rögzített állomása HU, a nemzetközi részfeladat még hiányzik."
+                )
             return _res(
                 f"Export típusnál HU felrakó és nem-HU lerakó kellene, itt minden állomás HU. "
                 f"Nemzetközi részfeladat nem található a törzsben — vagy nincs rögzítve, vagy a "
@@ -427,6 +470,10 @@ def analyze_torzs_type(torzs: str, torzs_group: pd.DataFrame):
                     "fel-/lerakó típusa ellenőrizendő.",
                     implies_complete=True,
                 )
+            if near_window_end:
+                return _truncated_res(
+                    "A törzs minden rögzített állomása HU, a nemzetközi részfeladat még hiányzik."
+                )
             return _res(
                 f"Import típusnál nem-HU felrakó és HU lerakó kellene, itt minden állomás HU. "
                 f"Nemzetközi részfeladat nem található — vagy nincs rögzítve, vagy a lekérdezett "
@@ -443,6 +490,11 @@ def analyze_torzs_type(torzs: str, torzs_group: pd.DataFrame):
         if fel_hu and le_hu:
             return None  # szabályos EU körfuvar
         if fel_hu and not le_hu:
+            if near_window_end:
+                return _truncated_res(
+                    f"Az utolsó rögzített lerakó külföldön van ({last['fsz']}: {last['le']}), "
+                    f"a hazatérő szakasz még hiányzik."
+                )
             return _res(
                 f"EU körfuvarnak HU-ban kell zárnia, de az utolsó rögzített lerakó külföldön van "
                 f"({last['fsz']}: {last['le']}). A hazatérő szakasz hiányzik: vagy nincs rögzítve "
@@ -460,12 +512,15 @@ def analyze_torzs_type(torzs: str, torzs_group: pd.DataFrame):
     return None
 
 
-def validate_torzs_type(torzs: str, torzs_group: pd.DataFrame):
+def validate_torzs_type(torzs: str, torzs_group: pd.DataFrame, window_end=None):
     """Egy fuvarszám-törzsre visszaadja a fuvarfeladat típus validációs hibáit
     (szöveges lista a kör-magyarázathoz). A részletes elemzést az
-    analyze_torzs_type végzi."""
-    res = analyze_torzs_type(torzs, torzs_group)
-    if res is None:
+    analyze_torzs_type végzi.
+
+    v4.6: az időszak-vég miatt csonkolt törzs (window_truncated) NEM hiba —
+    arra a kör-szintű kék 'időszak után záródó' jelölés hívja fel a figyelmet."""
+    res = analyze_torzs_type(torzs, torzs_group, window_end=window_end)
+    if res is None or res.get('window_truncated'):
         return []
     return [
         f"Hibás fuvarfeladat típus – törzs {torzs} ({res['tipus']}), viszonylat: "
@@ -589,7 +644,8 @@ def _build_vontatmany_change_explanation(torzs: str, torzs_history: list):
 
 def build_full_kor_explanation(legs_ordered, torzsek_a_korben, torzs_history_map,
                                torzs_group_map, ures_visszafutas_gyanu=False,
-                               implies_complete=False):
+                               implies_complete=False, idoszak_utan_zarodo=False,
+                               window_end=None):
     """Összeállítja a kör teljes magyarázatát több szempont figyelembevételével:
       1) Vontatmány váltás minden érintett törzsre
          v4.1: ha a törzs MINDEN részfeladata ebben a körben van (a törzs-alapú
@@ -605,6 +661,15 @@ def build_full_kor_explanation(legs_ordered, torzsek_a_korben, torzs_history_map
     has_tipus_hiba = False
 
     kor_fuvarszamok = {l[0] for l in legs_ordered}
+
+    # 0) Időszak után záródó kör (v4.6) — a legelső helyen jelezzük
+    if idoszak_utan_zarodo:
+        parts.append(
+            '⏭️ Időszak után záródó kör (valószínű): a kör a feltöltött adatablak utolsó '
+            'napjaiban szakad félbe — a záró szakasz / hiányzó részfeladat a következő '
+            'időszakban várható. Ez NEM rögzítési hiba; a kör a pénzügyi kimutatásokból '
+            'kizárva. A következő időszak fuvarnaplójával együtt futtatva teljes lesz.'
+        )
 
     # 1) Vontatmány váltás
     for torzs in torzsek_a_korben:
@@ -627,7 +692,7 @@ def build_full_kor_explanation(legs_ordered, torzsek_a_korben, torzs_history_map
         grp = torzs_group_map.get(torzs)
         if grp is None:
             continue
-        errs = validate_torzs_type(torzs, grp)
+        errs = validate_torzs_type(torzs, grp, window_end=window_end)
         for e in errs:
             parts.append(e)
             has_tipus_hiba = True
@@ -640,9 +705,11 @@ def build_full_kor_explanation(legs_ordered, torzsek_a_korben, torzs_history_map
 
     combined = '  ///  '.join(parts)
 
-    # Szín prioritás: szétesett törzs > típus hiba > tartalom szerinti
+    # Szín prioritás: szétesett törzs > időszak után záródó (kék) > típus hiba > tartalom
     if has_vontatmany_hiba:
         color = 'background-color: lightcoral'
+    elif idoszak_utan_zarodo:
+        color = 'background-color: lightblue'
     elif has_tipus_hiba:
         color = 'background-color: orange'
     else:
@@ -813,9 +880,12 @@ def generate_result_df(df: pd.DataFrame) -> pd.DataFrame:
         for torzs, grp in df_indexed.groupby('_torzs')
     }
 
+    # A feltöltött adatablak vége (időszak-vég csonkolás felismeréséhez, v4.6)
+    window_end = df['Utolsó Leadási állomás időkapu (dátum)'].max()
+
     # Törzs-szintű típus-elemzés (1x, cache-elve)
     torzs_analysis_map = {
-        torzs: analyze_torzs_type(torzs, grp)
+        torzs: analyze_torzs_type(torzs, grp, window_end=window_end)
         for torzs, grp in torzs_group_map.items()
     }
 
@@ -870,6 +940,19 @@ def generate_result_df(df: pd.DataFrame) -> pd.DataFrame:
         for cand in (krf_zar_ido, sem_zar_ido, kif_zar_ido):
             if pd.isna(kor_veg):
                 kor_veg = cand
+
+        # Időszak után záródó kör (v4.6): vagy ablak-vég miatt csonkolt törzs van
+        # benne, vagy import-zárás nélküli kör, amelynek vége az adatablak utolsó
+        # napjaira esik (a záró import a következő időszakban várható)
+        idoszak_utan_zarodo = any(
+            (torzs_analysis_map.get(t) or {}).get('window_truncated', False)
+            for t in torzsek_a_korben
+        )
+        if (not idoszak_utan_zarodo and has_kifele and not has_befele
+                and pd.notna(kor_veg) and pd.notna(window_end)
+                and (pd.Timestamp(window_end) - pd.Timestamp(kor_veg)).days
+                <= WINDOW_TRUNCATION_DAYS):
+            idoszak_utan_zarodo = True
 
         # Időrendben rendezett részfeladat lista a magyarázathoz
         legs_sorted_for_expl = legs_df.sort_values([
@@ -941,6 +1024,7 @@ def generate_result_df(df: pd.DataFrame) -> pd.DataFrame:
             '_Has_semleges': has_semleges,
             '_Has_korfuvar': has_korfuvar,
             '_Implies_complete': implies_complete,
+            '_Idoszak_utan_zarodo': idoszak_utan_zarodo,
             '_Ures_visszafutas_gyanu': ures_gyanu,
             '_Korben_Fuvarszam_lista': legs_df['Fuvarszám'].astype(str).tolist(),
             '_Korben_Jaratszam_lista': jaratszamok_lista,
@@ -965,6 +1049,8 @@ def generate_result_df(df: pd.DataFrame) -> pd.DataFrame:
             torzs_group_map=torzs_group_map,
             ures_visszafutas_gyanu=bool(row.get('_Ures_visszafutas_gyanu')),
             implies_complete=bool(row.get('_Implies_complete')),
+            idoszak_utan_zarodo=bool(row.get('_Idoszak_utan_zarodo')),
+            window_end=window_end,
         )
         magy.append(exp)
         szin.append(color)
@@ -984,6 +1070,8 @@ def build_tipushiba_table(result_df: pd.DataFrame, df: pd.DataFrame) -> pd.DataF
             _torzs=df['Fuvarszám'].astype(str).map(_torzs_of)
         ).groupby('_torzs')
     }
+    window_end = df['Utolsó Leadási állomás időkapu (dátum)'].max() \
+        if 'Utolsó Leadási állomás időkapu (dátum)' in df.columns else None
     rows = []
     seen = set()
     for _, r in result_df.iterrows():
@@ -991,12 +1079,14 @@ def build_tipushiba_table(result_df: pd.DataFrame, df: pd.DataFrame) -> pd.DataF
             if t in seen:
                 continue
             seen.add(t)
-            res = analyze_torzs_type(t, torzs_group_map.get(t))
+            res = analyze_torzs_type(t, torzs_group_map.get(t), window_end=window_end)
             if res is None:
                 continue
             rows.append({
                 'Törzs': res['torzs'],
                 'Kör ID': r['Kör ID'],
+                'Kategória': ('időszak után záródó (nem hiba)'
+                              if res.get('window_truncated') else 'javítandó hiba'),
                 'Fuvarszámok': res['fuvarszamok'],
                 'Járatszámok': res['jaratszamok'],
                 'Jelenlegi típus': res['tipus'],
@@ -1009,18 +1099,25 @@ def build_tipushiba_table(result_df: pd.DataFrame, df: pd.DataFrame) -> pd.DataF
 
 
 def build_osszesito_table(result_df: pd.DataFrame) -> pd.DataFrame:
-    """Összesítő tábla: kör-darabszámok kategóriánként + bevétel/költség/eredmény szummák."""
-    szin = result_df.get('Magyarázat_szín', pd.Series('', index=result_df.index)).astype(str)
+    """Összesítő tábla: kör-darabszámok kategóriánként + bevétel/költség/eredmény szummák.
+
+    v4.6: az 'időszak után záródó' (kék) körök a pénzügyi mutatókból KIZÁRVA."""
+    szin_all = result_df.get('Magyarázat_szín', pd.Series('', index=result_df.index)).astype(str)
+    kizart_mask = szin_all.str.contains('lightblue')
+    base = result_df[~kizart_mask]
+    szin = base.get('Magyarázat_szín', pd.Series('', index=base.index)).astype(str)
+
     n = len(result_df)
+    n_kizart = int(kizart_mask.sum())
     n_zold = int(szin.str.contains('lightgreen').sum())
     n_piros = int(szin.str.contains('lightcoral').sum())
-    n_narancs = n - n_zold - n_piros
+    n_narancs = len(base) - n_zold - n_piros
 
-    bev = pd.to_numeric(result_df.get('Összes díj részarány (EUR)'), errors='coerce')
-    tk = pd.to_numeric(result_df.get('Teljes költség'), errors='coerce') \
-        if 'Teljes költség' in result_df.columns else pd.Series(dtype=float)
-    er = pd.to_numeric(result_df.get('Járati eredmény'), errors='coerce') \
-        if 'Járati eredmény' in result_df.columns else pd.Series(dtype=float)
+    bev = pd.to_numeric(base.get('Összes díj részarány (EUR)'), errors='coerce')
+    tk = pd.to_numeric(base.get('Teljes költség'), errors='coerce') \
+        if 'Teljes költség' in base.columns else pd.Series(dtype=float)
+    er = pd.to_numeric(base.get('Járati eredmény'), errors='coerce') \
+        if 'Járati eredmény' in base.columns else pd.Series(dtype=float)
 
     rows = [
         ('Generálta', f'Bábolna Körfuvar Generálás {APP_VERSION} ({APP_RELEASE_DATE})'),
@@ -1028,6 +1125,7 @@ def build_osszesito_table(result_df: pd.DataFrame) -> pd.DataFrame:
         ('Teljes kör – zöld (db)', n_zold),
         ('Részleges / hibás – narancs (db)', n_narancs),
         ('Szétesett törzs – piros (db)', n_piros),
+        ('Időszak után záródó – kék, pénzügyi kimutatásból kizárva (db)', n_kizart),
         ('Összes bevétel – díj részarány (EUR)', round(float(bev.sum()), 2) if len(bev) else 0),
         ('Összes költség (EUR)', round(float(tk.sum()), 2) if len(tk) else None),
         ('Összes járati eredmény (EUR)', round(float(er.sum()), 2) if len(er) else None),
@@ -1044,6 +1142,13 @@ def build_relacio_table(result_df: pd.DataFrame) -> pd.DataFrame:
     if 'Célország' not in result_df.columns or result_df.empty:
         return pd.DataFrame()
     t = result_df.copy()
+    # v4.6: időszak után záródó körök kizárva a profit-elemzésből
+    if '_Idoszak_utan_zarodo' in t.columns:
+        t = t[~t['_Idoszak_utan_zarodo'].fillna(False).astype(bool)]
+    elif 'Magyarázat_szín' in t.columns:
+        t = t[~t['Magyarázat_szín'].astype(str).str.contains('lightblue')]
+    if t.empty:
+        return pd.DataFrame()
     t['_bev'] = pd.to_numeric(t.get('Összes díj részarány (EUR)'), errors='coerce')
     t['_tk'] = pd.to_numeric(t.get('Teljes költség'), errors='coerce')
     t['_er'] = pd.to_numeric(t.get('Járati eredmény'), errors='coerce')
@@ -1069,6 +1174,11 @@ def build_megbizo_table(result_df: pd.DataFrame) -> pd.DataFrame:
     költségét/eredményét a díj részarányuk arányában osztjuk fel közöttük."""
     rows = []
     for _, r in result_df.iterrows():
+        # v4.6: időszak után záródó körök kizárva a profit-elemzésből
+        if bool(r.get('_Idoszak_utan_zarodo')):
+            continue
+        if 'lightblue' in str(r.get('Magyarázat_szín', '')):
+            continue
         md = r.get('_Korben_Megbizo_dij') or {}
         if not md:
             continue
@@ -1437,6 +1547,8 @@ def _css_to_openpyxl_fill(css: str):
         return None
     if 'lightgreen' in css:
         return PatternFill('solid', start_color='C6EFCE')
+    if 'lightblue' in css:
+        return PatternFill('solid', start_color='BDD7EE')
     if 'orange' in css:
         return PatternFill('solid', start_color='FFD699')
     if 'lightcoral' in css:
@@ -1578,13 +1690,22 @@ def build_month_xlsx(result_df_display: pd.DataFrame, group_of_col: dict,
                     ws.cell(row=i + 2, column=magy_col).fill = fill
 
         # Szumma sor (bevétel / költségek / eredmény / futási adatok)
+        # v4.6: az 'időszak után záródó' (kék) körök a szummából kizárva
+        if 'Magyarázat_szín' in result_df_display.columns:
+            _kizart = result_df_display['Magyarázat_szín'].astype(str) \
+                .str.contains('lightblue').values
+        else:
+            _kizart = pd.Series(False, index=xlsx_df.index).values
+        _sum_base = xlsx_df[~_kizart]
         sum_fill = PatternFill('solid', start_color='DDDDDD')
         sum_row_idx = ws.max_row + 1
-        ws.cell(row=sum_row_idx, column=1).value = 'ÖSSZESEN'
+        ws.cell(row=sum_row_idx, column=1).value = (
+            'ÖSSZESEN (időszak után záródó körök nélkül)' if _kizart.any() else 'ÖSSZESEN'
+        )
         ws.cell(row=sum_row_idx, column=1).fill = sum_fill
         for col_name, col_idx in header_to_col.items():
-            if col_name in sum_cols and col_name in xlsx_df.columns:
-                s = pd.to_numeric(xlsx_df[col_name], errors='coerce').sum()
+            if col_name in sum_cols and col_name in _sum_base.columns:
+                s = pd.to_numeric(_sum_base[col_name], errors='coerce').sum()
                 if pd.notna(s):
                     c = ws.cell(row=sum_row_idx, column=col_idx)
                     c.value = round(float(s), 2)
@@ -1609,17 +1730,21 @@ def build_havi_osszesito_table(month_results: dict) -> pd.DataFrame:
     month_results: {label: finalizált result_df}"""
     rows = []
     for label, rdf in month_results.items():
-        szin = rdf.get('Magyarázat_szín', pd.Series('', index=rdf.index)).astype(str)
-        bev = pd.to_numeric(rdf.get('Összes díj részarány (EUR)'), errors='coerce')
-        tk = pd.to_numeric(rdf.get('Teljes költség'), errors='coerce') \
-            if 'Teljes költség' in rdf.columns else pd.Series(dtype=float)
-        er = pd.to_numeric(rdf.get('Járati eredmény'), errors='coerce') \
-            if 'Járati eredmény' in rdf.columns else pd.Series(dtype=float)
+        szin_all = rdf.get('Magyarázat_szín', pd.Series('', index=rdf.index)).astype(str)
+        kizart_mask = szin_all.str.contains('lightblue')
+        base = rdf[~kizart_mask]
+        szin = base.get('Magyarázat_szín', pd.Series('', index=base.index)).astype(str)
+        bev = pd.to_numeric(base.get('Összes díj részarány (EUR)'), errors='coerce')
+        tk = pd.to_numeric(base.get('Teljes költség'), errors='coerce') \
+            if 'Teljes költség' in base.columns else pd.Series(dtype=float)
+        er = pd.to_numeric(base.get('Járati eredmény'), errors='coerce') \
+            if 'Járati eredmény' in base.columns else pd.Series(dtype=float)
         rows.append({
             'Hónap': label,
             'Körök (db)': len(rdf),
             'Teljes kör (db)': int(szin.str.contains('lightgreen').sum()),
             'Részleges/hibás (db)': int((~szin.str.contains('lightgreen')).sum()),
+            'Időszak után záródó – kizárva (db)': int(kizart_mask.sum()),
             'Bevétel (EUR)': round(float(bev.sum()), 2) if len(bev) else 0,
             'Költség (EUR)': round(float(tk.sum()), 2) if len(tk) and tk.notna().any() else None,
             'Eredmény (EUR)': round(float(er.sum()), 2) if len(er) and er.notna().any() else None,
@@ -1632,6 +1757,7 @@ def build_havi_osszesito_table(month_results: dict) -> pd.DataFrame:
             'Körök (db)': int(out['Körök (db)'].sum()),
             'Teljes kör (db)': int(out['Teljes kör (db)'].sum()),
             'Részleges/hibás (db)': int(out['Részleges/hibás (db)'].sum()),
+            'Időszak után záródó – kizárva (db)': int(out['Időszak után záródó – kizárva (db)'].sum()),
             'Bevétel (EUR)': round(float(pd.to_numeric(out['Bevétel (EUR)'], errors='coerce').sum()), 2),
             'Költség (EUR)': round(float(pd.to_numeric(out['Költség (EUR)'], errors='coerce').sum()), 2),
             'Eredmény (EUR)': round(float(pd.to_numeric(out['Eredmény (EUR)'], errors='coerce').sum()), 2),
