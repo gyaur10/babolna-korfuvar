@@ -1,13 +1,25 @@
 import io
 import re
+import unicodedata
 
 import pandas as pd
 import streamlit as st
 from openpyxl.styles import PatternFill
 
-APP_VERSION = 'v4.6'
-APP_RELEASE_DATE = '2026-07-17'
+APP_VERSION = 'v4.7'
+APP_RELEASE_DATE = '2026-09-01'
 APP_CHANGELOG = {
+    'v4.7 (2026-09-01)': 'Ügyfél-ellenőrzés alapján: (1) cím-normalizálás újraírva — '
+                         'régi/kötőjeles/szóköz nélküli országkód, országnév a cím '
+                         'végén, adatból tanult irányítószám+város → ország szótár; '
+                         'megszűnt a hibás "4 jegyű irányítószám = HU" szabály. '
+                         '(2) Sorrend-robusztus típus-validáció: ha a részfeladat-'
+                         'sorszámok ellentmondanak az időkapuknak, és az időrend '
+                         'szerinti lánc konzisztens, nincs többé fals típushiba. '
+                         '(3) Új oszlopok: Fuvarfeladat típusok, Javasolt típus-javítás, '
+                         'Kör kezdete hónap, Átnyúló kör. (4) Hónaphatáron átnyúló '
+                         'körök kimutatása az Összesítőn és a Havi összesítőn. '
+                         '(5) Új munkalapok: Részfeladat-sorrend eltérés, Feloldatlan címek.',
     'v4.6 (2026-07-17)': 'Időszak után záródó körök felismerése: ha a kör / a hiányzó '
                          'nemzetközi részfeladat a feltöltött adatablak utolsó napjaira esik, '
                          'az nem rögzítési hiba, hanem a kör a következő időszakban fejeződik '
@@ -55,48 +67,304 @@ COUNTRY_TOLL_CATEGORIES = {
     'Olasz', 'Osztrák', 'Spanifer', 'Szlovák', 'Szlovén',
 }
 
-# Ismert ország-prefixek a cím-normalizáláshoz (case-insensitive match)
+# ---------------------------------------------------------------------------
+# Cím-normalizálás (v4.7) – ország-felismerés
+#
+# A fuvarnaplóban a címek jelentős része nem szabványos: hiányzik az országkód
+# ('6500 Baja...'), régi/egybetűs kód szerepel ('H-2800', 'D-31737', 'A 9020'),
+# szóköz nélküli kód ('DE54552'), vagy csak a cím VÉGÉN van ország
+# ('..., 38855 Wernigerode, Németország').
+#
+# A v4.6-ig érvényes szabály – "4 jegyű irányítószám prefix nélkül → HU" –
+# hamis HU-t adott a 4 jegyű irányítószámot használó országokra is
+# (BE/LU/AT/CH/DK/NL), ami hamis típushibákat okozott (pl. '4000 Liége' →
+# HU→HU Import lánc → "hiányzó nemzetközi részfeladat" fals riasztás).
+#
+# Az új feloldás sorrendje:
+#   1. explicit országkód prefix (ISO2, régi egybetűs, kötőjeles, szóköz nélküli)
+#   2. országnév a címben bárhol (magyar / angol / német / helyi alak)
+#   3. adatból épített irányítószám+város → ország szótár (gazetteer):
+#      a PREFIXES címekből tanulunk, és azt alkalmazzuk a prefix nélküliekre
+#   4. utcanév-nyelv + irányítószám-hossz heurisztika (5 jegyű + 'Straße' → DE, …)
+#   5. 4 jegyű irányítószám / magyar utcanév-jelölő, külföldi jel nélkül → HU
+#   6. egyébként '??' (és bekerül a "Feloldatlan címek" riportba)
+# ---------------------------------------------------------------------------
+_CC_ISO2 = {
+    'HU', 'AT', 'DE', 'FR', 'IT', 'NL', 'BE', 'ES', 'SK', 'SI', 'PL', 'CZ', 'RO', 'HR',
+    'CH', 'GB', 'UK', 'SE', 'DK', 'PT', 'LU', 'LT', 'LV', 'EE', 'BG', 'GR', 'FI', 'IE',
+    'NO', 'RS', 'BA', 'MK', 'TR', 'UA', 'MD', 'AL', 'ME', 'LI', 'MT', 'CY', 'IS',
+}
+_CC_ALIAS = {
+    'UK': 'GB', 'H': 'HU', 'D': 'DE', 'A': 'AT', 'I': 'IT', 'F': 'FR', 'B': 'BE',
+    'E': 'ES', 'P': 'PT', 'L': 'LU', 'N': 'NO', 'S': 'SE', 'M': 'MT', 'FIN': 'FI',
+    'SLO': 'SI', 'IRL': 'IE', 'SRB': 'RS', 'BIH': 'BA', 'EST': 'EE',
+}
+
+# Visszafelé kompatibilitás: a régi _CC_RE-t más kód is használhatja
 _CC_RE = re.compile(
     r'^(HU|AT|DE|FR|IT|NL|BE|ES|SK|SI|PL|CZ|RO|HR|CH|GB|UK|SE|DK|PT|LU|LT|LV|EE|BG|GR|FI|IE|NO)\s',
     re.IGNORECASE,
 )
 
+_COUNTRY_NAMES = {
+    'magyarorszag': 'HU', 'hungary': 'HU', 'ungarn': 'HU', 'hongrie': 'HU',
+    'nemetorszag': 'DE', 'germany': 'DE', 'deutschland': 'DE', 'allemagne': 'DE',
+    'ausztria': 'AT', 'austria': 'AT', 'osterreich': 'AT', 'autriche': 'AT',
+    'olaszorszag': 'IT', 'italy': 'IT', 'italia': 'IT', 'italien': 'IT',
+    'franciaorszag': 'FR', 'france': 'FR', 'frankreich': 'FR',
+    'belgium': 'BE', 'belgique': 'BE', 'belgie': 'BE', 'belgien': 'BE',
+    'hollandia': 'NL', 'netherlands': 'NL', 'nederland': 'NL', 'niederlande': 'NL',
+    'csehorszag': 'CZ', 'czechia': 'CZ', 'tschechien': 'CZ',
+    'szlovakia': 'SK', 'slovakia': 'SK', 'slovensko': 'SK', 'slowakei': 'SK',
+    'lengyelorszag': 'PL', 'poland': 'PL', 'polska': 'PL', 'polen': 'PL',
+    'romania': 'RO', 'rumanien': 'RO',
+    'spanyolorszag': 'ES', 'spain': 'ES', 'espana': 'ES', 'spanien': 'ES',
+    'svajc': 'CH', 'switzerland': 'CH', 'schweiz': 'CH', 'suisse': 'CH',
+    'szlovenia': 'SI', 'slovenia': 'SI', 'slowenien': 'SI',
+    'horvatorszag': 'HR', 'croatia': 'HR', 'hrvatska': 'HR', 'kroatien': 'HR',
+    'luxemburg': 'LU', 'luxembourg': 'LU',
+    'portugalia': 'PT', 'portugal': 'PT',
+    'dania': 'DK', 'denmark': 'DK', 'danmark': 'DK',
+    'svedorszag': 'SE', 'sweden': 'SE', 'sverige': 'SE',
+    'egyesult kiralysag': 'GB', 'united kingdom': 'GB', 'anglia': 'GB', 'england': 'GB',
+    'irorszag': 'IE', 'ireland': 'IE',
+    'szerbia': 'RS', 'serbia': 'RS', 'torokorszag': 'TR', 'turkey': 'TR',
+    'ukrajna': 'UA', 'ukraine': 'UA', 'finnorszag': 'FI', 'finland': 'FI',
+    'norvegia': 'NO', 'norway': 'NO', 'gorogorszag': 'GR', 'greece': 'GR',
+    'bulgaria': 'BG', 'lithuania': 'LT', 'latvia': 'LV', 'estonia': 'EE',
+}
 
-# ---------------------------------------------------------------------------
-# Cím-normalizálás (v4.1): HU-felismerés kis/nagybetű és hiányzó prefix ellen védve
-# ---------------------------------------------------------------------------
-def is_hu_address(cim) -> bool:
-    """Egy állomás-cím Magyarországra mutat-e.
+# Városnév-kinyeréskor kihagyandó általános tokenek (utcatípus, cégforma, épület)
+_ADDR_STOPWORDS = {
+    'utca', 'ter', 'krt', 'korut', 'koz', 'dulo', 'hrsz', 'ipari', 'zona', 'ipartelep',
+    'street', 'road', 'str', 'strasse', 'strase', 'weg', 'allee', 'platz', 'gasse',
+    'ring', 'damm', 'via', 'viale', 'strada', 'corso', 'piazza', 'localita', 'loc',
+    'rue', 'avenue', 'boulevard', 'chemin', 'route', 'impasse', 'laan', 'straat',
+    'dreef', 'calle', 'poligono', 'carretera', 'ctra',
+    'gmbh', 'kft', 'zrt', 'sarl', 'spa', 'srl', 'plc', 'ltd', 'kgaa',
+    'des', 'les', 'del', 'della', 'van', 'der', 'den', 'und', 'and',
+    'sur', 'sous', 'saint', 'ste', 'auf', 'bei', 'zum', 'zur',
+    'nord', 'sud', 'est', 'ouest', 'ovest', 'ost', 'west', 'sued',
+    'industrial', 'industrie', 'industriegebiet', 'gewerbegebiet',
+    'logistics', 'logistik', 'terminal',
+}
+_ADDR_LETTERS_RE = re.compile(r'[^a-z ]+')
+_ADDR_PC_RE = re.compile(r'(?<!\d)(\d{4,6})(?!\d)')
 
-    Kezeli a valós adatproblémákat:
-      - 'HU ' / 'Hu ' / 'hu ' prefix (kis/nagybetű érzéketlen)
-      - 'Magyarország 2364 Ócsa ...' formátum
-      - hiányzó országprefix ('2800 Tatabánya ...'): 4 jegyű irányítószámmal
-        kezdődő cím prefix nélkül → HU-nak tekintjük
-      - más országkód prefix ('DE 47829 ...', '90427 Nürnberg' kivétel: 5 jegyű) → nem HU
+# Utcanév-nyelv jelölők (irányítószám-hosszal kombinálva ad országot)
+_LANG_DE_RE = re.compile(r'(strasse|straße|\bstr\.|\bstr\b|\bweg\b|\bgasse\b|platz|allee|anschlussstelle|gewerbegebiet|\bwerk\b)', re.I)
+_LANG_FR_RE = re.compile(r'(\brue\b|avenue|boulevard|\bchemin\b|\broute\b|impasse|zone industrielle|\bz\.i\.)', re.I)
+_LANG_IT_RE = re.compile(r'(\bvia\b|viale|strada|corso|piazza|localita|località)', re.I)
+_LANG_NL_RE = re.compile(r'(straat|\blaan\b|dreef)', re.I)
+_LANG_ES_RE = re.compile(r'(\bcalle\b|carretera|poligono|polígono)', re.I)
+
+_HU_MARK_RE = re.compile(r'(\butca\b|\bu\.|\bút\b|\but\.|\btér\b|\bkrt\b|körút|\bköz\b|dűlő|hrsz|ipari park|puszta|major)', re.I)
+_FOREIGN_MARK_RE = re.compile(
+    r'(\brue\b|avenue|boulevard|chemin|\broute\b|strasse|straße|\bstr\.|\bweg\b|\bgasse\b'
+    r'|platz|allee|\bvia\b|viale|strada|corso|piazza|calle|carretera|\bstreet\b|\broad\b'
+    r'|\blaan\b|straat|dreef)', re.I)
+
+
+def _addr_fold(s) -> str:
+    """Ékezet nélküli kisbetűs alak (unicode NFKD)."""
+    s = unicodedata.normalize('NFKD', str(s).lower())
+    s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+    return s.replace('ß', 'ss')
+
+
+def _addr_prefix_cc(c: str):
+    """Explicit országkód a cím elejéről ('HU 2943', 'D-31737', 'A 9020', 'DE54552')."""
+    m = (re.match(r'^([A-Za-z]{1,3})\s*[-–]\s*\d', c)
+         or re.match(r'^([A-Za-z]{1,3})\s+\d', c)
+         or re.match(r'^([A-Za-z]{2,3})(\d{4,6})\b', c)
+         or re.match(r'^([A-Za-z]{2,3})\s+[A-Za-zÀ-ž]', c))
+    if not m:
+        return None
+    code = m.group(1).upper()
+    code = _CC_ALIAS.get(code, code)
+    return code if code in _CC_ISO2 else None
+
+
+def _addr_country_name_cc(c: str):
+    """Országnév a címben bárhol ('…, Németország', '…, HUNGARY')."""
+    f = _addr_fold(c)
+    for name, code in _COUNTRY_NAMES.items():
+        if re.search(r'\b' + re.escape(name) + r'\b', f):
+            return code
+    return None
+
+
+def _addr_tokens(c: str):
+    folded = _addr_fold(c)
+    return [t for t in _ADDR_LETTERS_RE.sub(' ', folded).split()
+            if len(t) >= 3 and t not in _ADDR_STOPWORDS]
+
+
+class AddressGazetteer:
+    """Irányítószám+város → ország szótár, a saját adatból tanulva.
+
+    Az explicit országkóddal rögzített címekből (a címek ~95%-a) megtanuljuk,
+    hogy egy (irányítószám, városnév) vagy csak városnév melyik országhoz
+    tartozik, és ezt alkalmazzuk a prefix nélküli címekre.
     """
-    c = str(cim or '').strip()
-    if re.match(r'^hu\s', c, re.IGNORECASE):
-        return True
-    if c.lower().startswith('magyarország'):
-        return True
-    if _CC_RE.match(c):
-        return False
-    if re.match(r'^\d{4}\s', c):
-        return True
-    return False
+
+    def __init__(self):
+        self.pc_city = {}
+        self.city = {}
+        self.pc = {}
+
+    @staticmethod
+    def _bump(store, key, cc):
+        d = store.setdefault(key, {})
+        d[cc] = d.get(cc, 0) + 1
+
+    def add(self, cim, cc):
+        toks = _addr_tokens(cim)
+        pcs = _ADDR_PC_RE.findall(str(cim))
+        for t in toks:
+            self._bump(self.city, t, cc)
+        for p in pcs:
+            self._bump(self.pc, p, cc)
+            for t in toks:
+                self._bump(self.pc_city, (p, t), cc)
+
+    def build(self, cimek):
+        """Két menet: előbb az explicit prefixes címek, majd az országnévvel
+        azonosítottak (így a '…, Ausztria' variáns megtanítja a prefix nélkülit)."""
+        cimek = [str(c).strip() for c in cimek if str(c).strip()]
+        rest = []
+        for c in cimek:
+            cc = _addr_prefix_cc(c)
+            if cc:
+                self.add(c, cc)
+            else:
+                rest.append(c)
+        for c in rest:
+            cc = _addr_country_name_cc(c)
+            if cc:
+                self.add(c, cc)
+        return self
+
+    @staticmethod
+    def _best(counts):
+        if not counts:
+            return None
+        items = sorted(counts.items(), key=lambda kv: -kv[1])
+        if len(items) == 1 or items[0][1] >= 3 * items[1][1]:
+            return items[0][0]
+        return None
+
+    def lookup(self, cim):
+        c = str(cim).strip()
+        toks = _addr_tokens(c)
+        pcs = _ADDR_PC_RE.findall(c)
+        for p in pcs:
+            for t in toks:
+                r = self._best(self.pc_city.get((p, t)))
+                if r:
+                    return r
+        votes = {}
+        for t in toks:
+            r = self._best(self.city.get(t))
+            if r:
+                votes[r] = votes.get(r, 0) + 1
+        if votes:
+            top = sorted(votes.items(), key=lambda kv: -kv[1])
+            if len(top) == 1 or top[0][1] > top[1][1]:
+                return top[0][0]
+        for p in pcs:
+            r = self._best(self.pc.get(p))
+            if r:
+                return r
+        return None
+
+
+# Modul-szintű gazetteer: a pipeline elején töltjük fel a teljes fuvarnaplóból.
+_ADDR_GAZETTEER = AddressGazetteer()
+
+
+def build_address_gazetteer(df: pd.DataFrame,
+                            columns=('Első Felvételi állomás cím',
+                                     'Utolsó Leadási állomás cím')):
+    """A modul-szintű gazetteer (újra)építése a fuvarnapló címeiből."""
+    global _ADDR_GAZETTEER
+    vals = []
+    for c in columns:
+        if c in df.columns:
+            vals.extend(df[c].dropna().astype(str).unique().tolist())
+    _ADDR_GAZETTEER = AddressGazetteer().build(vals)
+    return _ADDR_GAZETTEER
+
+
+def _addr_lang_cc(c: str):
+    """Utcanév-nyelv + irányítószám-hossz heurisztika (csak prefix/gazetteer után)."""
+    pcs = _ADDR_PC_RE.findall(c)
+    plen = len(pcs[0]) if pcs else 0
+    if plen == 5:
+        if _LANG_DE_RE.search(c):
+            return 'DE'
+        if _LANG_IT_RE.search(c):
+            return 'IT'
+        if _LANG_FR_RE.search(c):
+            return 'FR'
+        if _LANG_ES_RE.search(c):
+            return 'ES'
+    if plen == 4:
+        if _LANG_NL_RE.search(c):
+            return 'NL'
+        if _LANG_DE_RE.search(c):
+            return 'AT'
+    return None
 
 
 def country_of(cim) -> str:
-    """Egy állomás-cím országkódja ('HU', 'DE', ... vagy '??' ha nem felismerhető)."""
+    """Egy állomás-cím országkódja ('HU', 'DE', … vagy '??' ha nem felismerhető)."""
     c = str(cim or '').strip()
-    if is_hu_address(c):
+    if not c:
+        return '??'
+    cc = _addr_prefix_cc(c)
+    if cc:
+        return cc
+    cc = _addr_country_name_cc(c)
+    if cc:
+        return cc
+    cc = _ADDR_GAZETTEER.lookup(c)
+    if cc:
+        return cc
+    cc = _addr_lang_cc(c)
+    if cc:
+        return cc
+    pcs = _ADDR_PC_RE.findall(c)
+    if pcs and len(pcs[0]) == 4 and not _FOREIGN_MARK_RE.search(c):
         return 'HU'
-    m = _CC_RE.match(c)
-    if m:
-        code = m.group(1).upper()
-        return 'GB' if code == 'UK' else code
+    if _HU_MARK_RE.search(c) and not _FOREIGN_MARK_RE.search(c):
+        return 'HU'
     return '??'
+
+
+def is_hu_address(cim) -> bool:
+    """Egy állomás-cím Magyarországra mutat-e (a country_of feloldás alapján)."""
+    return country_of(cim) == 'HU'
+
+
+def unresolved_addresses(df: pd.DataFrame,
+                         columns=('Első Felvételi állomás cím',
+                                  'Utolsó Leadási állomás cím')) -> pd.DataFrame:
+    """A '??' országú (fel nem oldható) címek riportja – forrásrendszeri javításhoz."""
+    rows = {}
+    for col in columns:
+        if col not in df.columns:
+            continue
+        for cim in df[col].dropna().astype(str):
+            c = cim.strip()
+            if c and country_of(c) == '??':
+                rows[c] = rows.get(c, 0) + 1
+    if not rows:
+        return pd.DataFrame(columns=['Cím', 'Előfordulás'])
+    out = pd.DataFrame(sorted(rows.items(), key=lambda kv: -kv[1]),
+                       columns=['Cím', 'Előfordulás'])
+    return out
+
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +446,68 @@ def classify_leg_direction(row):
 # ---------------------------------------------------------------------------
 # Egy fuvarszám-törzs kezdő / záró sora
 # ---------------------------------------------------------------------------
+def _sort_legs_chronologically(group: pd.DataFrame) -> pd.DataFrame:
+    """Egy törzs (vagy kör) lábainak sorrendje IDŐREND szerint (v4.7).
+
+    v4.6-ig a rendezés a Fuvarszám részfeladat-sorszáma szerint történt. Az ügyfél
+    ellenőrzése kimutatta, hogy a részfeladat-sorszámok jelentős részben fel vannak
+    cserélve (tipikusan a 2. és 3. részfeladat), az IDŐKAPUK viszont helyesek.
+    A sorszám szerinti rendezés így hibás kezdő/záró lábat választott, ami hamis
+    "hibás fuvarfeladat típus" riasztásokat okozott.
+
+    Elsődleges kulcs: első felvételi időkapu, majd utolsó leadási időkapu,
+    végül – holtverseny esetén – a részfeladat-sorszám.
+    """
+    g = group.copy()
+    g['_reszfeladat'] = g['Fuvarszám'].map(_reszfeladat_of)
+    keys = [c for c in ('Első Felvételi állomás időkapu (dátum)',
+                        'Utolsó Leadási állomás időkapu (dátum)') if c in g.columns]
+    if keys and g[keys[0]].notna().any():
+        return g.sort_values(keys + ['_reszfeladat'], na_position='last')
+    return g.sort_values('_reszfeladat', na_position='last')
+
+
+def _reszfeladat_sorrend_elter(group: pd.DataFrame) -> bool:
+    """Igaz, ha a részfeladat-sorszámok sorrendje eltér az időrendtől."""
+    ordered = _sort_legs_chronologically(group)
+    nums = [n for n in ordered['_reszfeladat'].tolist() if pd.notna(n)]
+    return len(nums) > 1 and nums != sorted(nums)
+
+
+def build_reszfeladat_sorrend_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Riport azokról a törzsekről, ahol a részfeladat-sorszám ellentmond az időrendnek.
+
+    Nem hiba a kör szempontjából (a generálás időrend szerint dolgozik), de a
+    forrásrendszerben javítandó adatminőségi jelzés.
+    """
+    rows = []
+    tmp = df.assign(_torzs=df['Fuvarszám'].astype(str).map(_torzs_of))
+    for torzs, grp in tmp.groupby('_torzs'):
+        if len(grp) < 2:
+            continue
+        ordered = _sort_legs_chronologically(grp)
+        nums = [n for n in ordered['_reszfeladat'].tolist() if pd.notna(n)]
+        if len(nums) > 1 and nums != sorted(nums):
+            rows.append({
+                'Törzs': torzs,
+                'Részfeladatok időrendben': ', '.join(
+                    str(f) for f in ordered['Fuvarszám'].astype(str)),
+                'Sorszám-sorrend': ' → '.join(str(int(n)) for n in nums),
+                'Járatszámok': ', '.join(dict.fromkeys(
+                    ordered['Járatszám'].astype(str))),
+                'Első felvétel': ordered.iloc[0].get('Első Felvételi állomás időkapu (dátum)'),
+                'Utolsó leadás': ordered.iloc[-1].get('Utolsó Leadási állomás időkapu (dátum)'),
+                'Javasolt javítás': 'A részfeladat-sorszámok felcserélve — '
+                                    'a forrásrendszerben az időkapuk szerinti '
+                                    'sorrendre javítandók.',
+            })
+    if not rows:
+        return pd.DataFrame(columns=['Törzs', 'Részfeladatok időrendben', 'Sorszám-sorrend',
+                                     'Járatszámok', 'Első felvétel', 'Utolsó leadás',
+                                     'Javasolt javítás'])
+    return pd.DataFrame(rows).sort_values('Törzs').reset_index(drop=True)
+
+
 def _torzs_start_end(group: pd.DataFrame):
     """Egy adott fuvarszám-törzs csoportjára visszaadja a törzs kezdő és záró sorát.
     - Ha van értelmezhető részfeladat szám (-1, -2, ...), akkor a legkisebb részfeladatszámú
@@ -279,7 +609,8 @@ def _classify_fuvarfeladat_type_expected(tipus_str) -> str:
     return 'ISMERETLEN'
 
 
-def analyze_torzs_type(torzs: str, torzs_group: pd.DataFrame, window_end=None):
+def _analyze_torzs_type_ordered(torzs: str, torzs_group: pd.DataFrame,
+                                window_end=None, order='reszfeladat'):
     """Komplex fuvarfeladat típus + állomás-típus validáció egy törzsre.
 
     A törzs ÖSSZES részfeladatát vizsgálja (részfeladat-sorszám szerinti sorrendben),
@@ -305,12 +636,8 @@ def analyze_torzs_type(torzs: str, torzs_group: pd.DataFrame, window_end=None):
         return None
 
     grp = torzs_group.copy()
-    grp['_reszfeladat'] = grp['Fuvarszám'].map(_reszfeladat_of)
-    if grp['_reszfeladat'].notna().any():
-        grp = grp.sort_values(['_reszfeladat', 'Első Felvételi állomás időkapu (dátum)'],
-                              na_position='last')
-    else:
-        grp = grp.sort_values('Első Felvételi állomás időkapu (dátum)')
+    grp = (_sort_legs_chronologically(grp) if order == 'chrono'
+           else _sort_legs_by_reszfeladat(grp))
 
     legs = []
     for _, r in grp.iterrows():
@@ -510,6 +837,49 @@ def analyze_torzs_type(torzs: str, torzs_group: pd.DataFrame, window_end=None):
 
     # SEMLEGES / ISMERETLEN → nem validáljuk
     return None
+
+
+def _sort_legs_by_reszfeladat(group: pd.DataFrame) -> pd.DataFrame:
+    """Lábak sorrendje a Fuvarszám részfeladat-sorszáma szerint (a v4.6-os viselkedés)."""
+    g = group.copy()
+    if '_reszfeladat' not in g.columns:
+        g['_reszfeladat'] = g['Fuvarszám'].map(_reszfeladat_of)
+    if g['_reszfeladat'].notna().any():
+        return g.sort_values(['_reszfeladat', 'Első Felvételi állomás időkapu (dátum)'],
+                             na_position='last')
+    return g.sort_values('Első Felvételi állomás időkapu (dátum)')
+
+
+# A sorrend-ellentmondás miatt "megmentett" törzsek: a részfeladat-sorszám szerinti
+# lánc típushibásnak látszik, az időrend szerinti viszont konzisztens (v4.7).
+_ORDER_RESOLVED_TORZSEK = {}
+
+
+def analyze_torzs_type(torzs: str, torzs_group: pd.DataFrame, window_end=None):
+    """Típus-/állomás-validáció sorrend-robusztusan (v4.7).
+
+    A validáció alapértelmezésben a részfeladat-sorszám szerinti láncot vizsgálja.
+    Az ügyfél ellenőrzése kimutatta, hogy a sorszámok egy részénél a 2. és 3.
+    részfeladat fel van cserélve, miközben az időkapuk helyesek — ilyenkor a
+    sorszám szerinti lánc hamis "hibás fuvarfeladat típus" riasztást ad.
+
+    Ezért: ha a sorszám szerinti lánc hibát jelez, DE a két sorrend eltér és az
+    időrend szerinti lánc hibátlan, akkor nem típushibáról, hanem rögzítési
+    sorrend-hibáról van szó → nem adunk típushibát, a törzs a
+    "Részfeladat-sorrend eltérés" riportba kerül.
+    """
+    res = _analyze_torzs_type_ordered(torzs, torzs_group, window_end=window_end,
+                                      order='reszfeladat')
+    if res is None:
+        return None
+    if not _reszfeladat_sorrend_elter(torzs_group):
+        return res
+    alt = _analyze_torzs_type_ordered(torzs, torzs_group, window_end=window_end,
+                                      order='chrono')
+    if alt is None:
+        _ORDER_RESOLVED_TORZSEK[str(torzs)] = res.get('hiba', '')
+        return None
+    return res
 
 
 def validate_torzs_type(torzs: str, torzs_group: pd.DataFrame, window_end=None):
@@ -851,6 +1221,10 @@ def generate_result_df(df: pd.DataFrame) -> pd.DataFrame:
 
     Elvárás: a df-ben az időkapu oszlopok datetime-ok és az 'Irány' oszlop kitöltött.
     """
+    # Cím-gazetteer építése a teljes adathalmazból (v4.7) – a prefix nélküli
+    # címek országa a prefixes címekből tanult (irányítószám, város) párokból jön.
+    build_address_gazetteer(df)
+
     # Előindexelés törzsenként (vontatmány-váltás leíráshoz és típus-validációhoz)
     tmp_torzs = df['Fuvarszám'].astype(str).map(_torzs_of)
     df_indexed = df.assign(_torzs=tmp_torzs)
@@ -858,14 +1232,7 @@ def generate_result_df(df: pd.DataFrame) -> pd.DataFrame:
     torzs_history_map = {}
     for torzs, grp in df_indexed.groupby('_torzs'):
         grp = grp.copy()
-        grp['_reszfeladat'] = grp['Fuvarszám'].map(_reszfeladat_of)
-        if grp['_reszfeladat'].notna().any():
-            grp = grp.sort_values(
-                ['_reszfeladat', 'Első Felvételi állomás időkapu (dátum)'],
-                na_position='last',
-            )
-        else:
-            grp = grp.sort_values('Első Felvételi állomás időkapu (dátum)')
+        grp = _sort_legs_by_reszfeladat(grp)
         torzs_history_map[torzs] = [
             {
                 'fuvarszám': str(r['Fuvarszám']),
@@ -993,6 +1360,29 @@ def generate_result_df(df: pd.DataFrame) -> pd.DataFrame:
                 megbizo_dij[m] = float(pd.to_numeric(s, errors='coerce').fillna(0).sum())
         all_megbizok = ' | '.join(megbizo_dij.keys())
 
+        # Rögzített fuvarfeladat típusok a körben (v4.7) – időrendi lábsorrendben,
+        # ismétlés nélkül; így az ügyfél a kimeneten látja, mit lát a rendszer.
+        if 'Fuvarfeladat típusa' in legs_sorted_for_expl.columns:
+            tipusok = ' | '.join(dict.fromkeys(
+                str(t).strip() for t in legs_sorted_for_expl['Fuvarfeladat típusa']
+                if str(t).strip() and str(t).strip().lower() != 'nan'))
+        else:
+            tipusok = ''
+        # Javasolt típus-javítás a törzs-elemzésből (ha van)
+        javaslatok = []
+        for _t in torzsek_a_korben:
+            _a = torzs_analysis_map.get(_t) or {}
+            _j = str(_a.get('javaslat') or '').strip()
+            if _j and _j not in javaslatok:
+                javaslatok.append(_j)
+        javasolt_tipus = ' | '.join(javaslatok)
+
+        # Hónaphatár-átnyúlás (v4.7): a kör a Kör vége hónapjához van rendelve,
+        # de ha a Kör kezdete korábbi hónapra esik, azt külön jelöljük.
+        kezdet_ho = (f'{pd.Timestamp(kor_kezd):%Y-%m}' if pd.notna(kor_kezd) else '')
+        vege_ho = (f'{pd.Timestamp(kor_veg):%Y-%m}' if pd.notna(kor_veg) else '')
+        atnyulo = bool(kezdet_ho and vege_ho and kezdet_ho != vege_ho)
+
         row = {
             'Kör ID': kor_id,
             'Vontatmány': vontatmany,
@@ -1000,9 +1390,13 @@ def generate_result_df(df: pd.DataFrame) -> pd.DataFrame:
             'Megbízók': all_megbizok,
             'Reláció': relacio,
             'Célország': celorszag,
+            'Fuvarfeladat típusok': tipusok,
+            'Javasolt típus-javítás': javasolt_tipus,
             'Járatszámok': all_jaratszamok,
             'Kör kezdete dátum': kor_kezd,
             'Kör vége dátum': kor_veg,
+            'Kör kezdete hónap': kezdet_ho,
+            'Átnyúló kör': 'igen' if atnyulo else '',
             'Kifelé kezdő időkapu': kif_kezd_ido,
             'Kifelé kezdő cím': kif_kezd_cim,
             'Kifelé záró időkapu': kif_zar_ido,
@@ -1026,6 +1420,7 @@ def generate_result_df(df: pd.DataFrame) -> pd.DataFrame:
             '_Implies_complete': implies_complete,
             '_Idoszak_utan_zarodo': idoszak_utan_zarodo,
             '_Ures_visszafutas_gyanu': ures_gyanu,
+            '_Atnyulo_kor': atnyulo,
             '_Korben_Fuvarszam_lista': legs_df['Fuvarszám'].astype(str).tolist(),
             '_Korben_Jaratszam_lista': jaratszamok_lista,
             '_Korben_Torzs_lista': torzsek_a_korben,
@@ -1133,6 +1528,23 @@ def build_osszesito_table(result_df: pd.DataFrame) -> pd.DataFrame:
         ('Veszteséges körök (db)', int((er < 0).sum()) if len(er) else None),
         ('Nyereséges körök (db)', int((er > 0).sum()) if len(er) else None),
     ]
+
+    # v4.7: hónaphatáron átnyúló körök (a kör az előző hónapban indult, de ebben
+    # a hónapban zárult → a teljes díja ehhez a hónaphoz kerül). A besorolás nem
+    # változik, csak láthatóvá tesszük, mekkora rész "csúszott át" a hónapok között.
+    if 'Átnyúló kör' in base.columns:
+        atny = base['Átnyúló kör'].astype(str).eq('igen')
+        n_atny = int(atny.sum())
+        bev_atny = pd.to_numeric(
+            base.loc[atny, 'Összes díj részarány (EUR)'], errors='coerce').sum()
+        bev_ossz = float(bev.sum()) if len(bev) else 0.0
+        rows.extend([
+            ('Előző hónapban indult, itt zárult kör (db)', n_atny),
+            ('Ebből származó bevétel (EUR)', round(float(bev_atny), 2)),
+            ('Ennek aránya a havi bevételből (%)',
+             round(100.0 * float(bev_atny) / bev_ossz, 1) if bev_ossz else 0.0),
+        ])
+
     return pd.DataFrame(rows, columns=['Mutató', 'Érték'])
 
 
@@ -1591,8 +2003,9 @@ TRUCK_ANIM_HTML = """
 
 IDENTITY_COLS = [
     'Kör ID', 'Vontatmány', 'Vontatók', 'Megbízók',
-    'Reláció', 'Célország', 'Járatszámok',
-    'Kör kezdete dátum', 'Kör vége dátum',
+    'Reláció', 'Célország', 'Fuvarfeladat típusok', 'Javasolt típus-javítás',
+    'Járatszámok',
+    'Kör kezdete dátum', 'Kör vége dátum', 'Kör kezdete hónap', 'Átnyúló kör',
     'Kifelé kezdő időkapu', 'Kifelé kezdő cím',
     'Kifelé záró időkapu', 'Kifelé záró cím',
     'Nemzetközi (semleges) kezdő időkapu', 'Nemzetközi (semleges) kezdő cím',
@@ -1745,6 +2158,13 @@ def build_havi_osszesito_table(month_results: dict) -> pd.DataFrame:
             'Teljes kör (db)': int(szin.str.contains('lightgreen').sum()),
             'Részleges/hibás (db)': int((~szin.str.contains('lightgreen')).sum()),
             'Időszak után záródó – kizárva (db)': int(kizart_mask.sum()),
+            'Előző hónapban indult kör (db)': int(
+                base['Átnyúló kör'].astype(str).eq('igen').sum())
+            if 'Átnyúló kör' in base.columns else 0,
+            'Előző hónapból áthozott bevétel (EUR)': round(float(pd.to_numeric(
+                base.loc[base['Átnyúló kör'].astype(str).eq('igen'),
+                         'Összes díj részarány (EUR)'], errors='coerce').sum()), 2)
+            if 'Átnyúló kör' in base.columns else 0,
             'Bevétel (EUR)': round(float(bev.sum()), 2) if len(bev) else 0,
             'Költség (EUR)': round(float(tk.sum()), 2) if len(tk) and tk.notna().any() else None,
             'Eredmény (EUR)': round(float(er.sum()), 2) if len(er) and er.notna().any() else None,
@@ -1758,6 +2178,9 @@ def build_havi_osszesito_table(month_results: dict) -> pd.DataFrame:
             'Teljes kör (db)': int(out['Teljes kör (db)'].sum()),
             'Részleges/hibás (db)': int(out['Részleges/hibás (db)'].sum()),
             'Időszak után záródó – kizárva (db)': int(out['Időszak után záródó – kizárva (db)'].sum()),
+            'Előző hónapban indult kör (db)': int(out['Előző hónapban indult kör (db)'].sum()),
+            'Előző hónapból áthozott bevétel (EUR)': round(float(pd.to_numeric(
+                out['Előző hónapból áthozott bevétel (EUR)'], errors='coerce').sum()), 2),
             'Bevétel (EUR)': round(float(pd.to_numeric(out['Bevétel (EUR)'], errors='coerce').sum()), 2),
             'Költség (EUR)': round(float(pd.to_numeric(out['Költség (EUR)'], errors='coerce').sum()), 2),
             'Eredmény (EUR)': round(float(pd.to_numeric(out['Eredmény (EUR)'], errors='coerce').sum()), 2),
@@ -1884,6 +2307,9 @@ if uploaded_logbooks:
         & (df['Utolsó Leadási állomás időkapu (dátum)']
            < df['Első Felvételi állomás időkapu (dátum)'])
     )
+    # v4.7: a cím-gazetteert már a riportok előtt fel kell építeni
+    build_address_gazetteer(df)
+
     datum_anomalia_df = df.loc[_anomalia_mask, [
         'Fuvarszám', 'Járatszám', 'Vontatmány', 'Megbízó',
         'Első Felvételi állomás időkapu (dátum)',
@@ -1896,6 +2322,23 @@ if uploaded_logbooks:
         )
         with st.expander('Dátum-anomáliás sorok megtekintése'):
             st.dataframe(datum_anomalia_df, use_container_width=True)
+
+    # v4.7 riportok: részfeladat-sorrend eltérés + feloldatlan címek
+    reszfeladat_sorrend_df = build_reszfeladat_sorrend_table(df)
+    if not reszfeladat_sorrend_df.empty:
+        st.info(
+            f'ℹ️ {len(reszfeladat_sorrend_df)} törzsnél a részfeladat-sorszámok sorrendje '
+            f'eltér az időkapuk sorrendjétől. A generálás ezt kezeli (nem ad rá hamis '
+            f'típushibát), de a forrásrendszerben javítandó — lásd a '
+            f'"Részfeladat-sorrend eltérés" munkalapot.'
+        )
+    feloldatlan_cim_df = unresolved_addresses(df)
+    if not feloldatlan_cim_df.empty:
+        st.info(
+            f'ℹ️ {len(feloldatlan_cim_df)} címnél az ország nem volt feloldható '
+            f'(hiányzó országkód és ismeretlen település) — lásd a "Feloldatlan címek" '
+            f'munkalapot.'
+        )
 
     # Elérhető év-hónap párok a leadási dátumok alapján
     _kv_dates = df['Utolsó Leadási állomás időkapu (dátum)'].dropna()
@@ -1926,6 +2369,8 @@ if uploaded_logbooks:
                     _progress.progress(int(min(max(pct, 0), 100)))
 
                 _status('Fuvarnapló elemzése, irányok osztályozása…', 5)
+                # A cím-gazetteert az irány-osztályozás ELŐTT kell felépíteni (v4.7)
+                build_address_gazetteer(df)
                 df['Irány'] = df.apply(classify_leg_direction, axis=1)
 
                 # Kör-építés EGYSZER, a teljes adathalmazon (a hónap-szűrés csak ezután
@@ -2029,6 +2474,8 @@ if uploaded_logbooks:
                             (megbizo_df, 'Megbízók'),
                             (tipushiba_df, 'Típushibák (javítandó)'),
                             (datum_anomalia_df, 'Dátum-anomáliák'),
+                            (reszfeladat_sorrend_df, 'Részfeladat-sorrend eltérés'),
+                            (feloldatlan_cim_df, 'Feloldatlan címek'),
                         ],
                     )
                     outputs[f'korfuvarok_{sel_year}_{sel_month}.xlsx'] = xlsx_bytes
