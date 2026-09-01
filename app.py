@@ -29,7 +29,17 @@ APP_CHANGELOG = {
                          'kijön, a kör normálisan legenerálódik (zöld), csak figyelmeztetést '
                          'kap — ℹ️ mondat a Magyarázatban, új "Sorrend-figyelmeztetés" oszlop, '
                          'és a "Részfeladat-sorrend eltérés" munkalap Hatás oszlopa '
-                         '(fals típushibát oldott fel / csak figyelmeztetés).',
+                         '(fals típushibát oldott fel / csak figyelmeztetés). '
+                         '(5) TELJESÍTMÉNY: a kör-generálás ~2,5x gyorsabb (9 hónapos, '
+                         '7877 soros adaton 23 mp → 9 mp). Törzsenkénti cache a '
+                         'típus-validációra (eddig kétszer futott) és a láb-rekordokra, '
+                         'lista-alapú rendezés a pandas sort_values helyett, memoizált '
+                         'cím-feloldás, get_interval_with_addresses pandas nélkül. '
+                         '(6) NAGY TÁBLA A FELÜLETEN: több hónap egyszerre több ezer sort '
+                         'jelentett, a Styler HTML-je megfektette az oldalt (a letöltés '
+                         'gombokig sem lehetett legörgetni). Mostantól hónaponként 150 sor '
+                         'előnézet, checkboxszal kérhető a teljes tábla (színezés nélkül, '
+                         'virtualizálva); a letöltött Excel mindig teljes.',
     'v4.7 (2026-09-01)': 'Ügyfél-ellenőrzés (Babolna_korfuvarfeladatok ellenőrzött) alapján: '
                          '(1) CÍM-NORMALIZÁLÁS újraírva — régi egybetűs, kötőjeles és szóköz '
                          'nélküli országkód (H-2800, D-31737, A 9020, DE54552), országnév a '
@@ -84,6 +94,12 @@ BABOLNA_KEYWORD = 'Bábolna Rákóczi utca'
 # belül van, akkor azt NEM hibaként, hanem "időszak után záródó kör (valószínű)"
 # kategóriaként kezeljük (kék jelölés), és kizárjuk a pénzügyi kimutatásokból.
 WINDOW_TRUNCATION_DAYS = 7
+
+# A képernyőn megjelenített kör-tábla maximális sorszáma hónaponként (v4.8).
+# A pandas Styler soronként generál HTML-t; több hónap egyszerre több ezer sort
+# jelentene, ami a böngészőt megfekteti (a letöltés gombokig sem lehet legörgetni).
+# A TELJES tábla mindig ott van a letölthető Excelben.
+UI_PREVIEW_ROWS = 150
 
 # Az első költség fájl ország-alapú kategóriái == a Flight Controlling fájl 'Útdíj költség'
 # járatonkénti bontása. Ha az FC 'Útdíj költség' oszlop is jelen van, a szummában csak
@@ -211,13 +227,22 @@ def _addr_prefix_cc(c: str):
     return code if code in _CC_ISO2 else None
 
 
+# Egyetlen előfordított alternáció a ~60 országnévre (60 külön re.search helyett)
+_COUNTRY_NAME_RE = re.compile(
+    r'\b(' + '|'.join(sorted((re.escape(n) for n in _COUNTRY_NAMES), key=len, reverse=True)) + r')\b'
+)
+
+
 def _addr_country_name_cc(c: str):
-    """Országnév a címben bárhol ('…, Németország', '…, HUNGARY')."""
-    f = _addr_fold(c)
-    for name, code in _COUNTRY_NAMES.items():
-        if re.search(r'\b' + re.escape(name) + r'\b', f):
-            return code
-    return None
+    """Országnév a címben — az UTOLSÓ előfordulás számít.
+
+    A cím végén álló ország a mérvadó, nem a cégnévben szereplő: pl.
+    'JRS-Austria-raktár, Papírgyári út 42., 2400 DUNAÚJVÁROS, HUNGARY' → HU, nem AT.
+    """
+    last = None
+    for m in _COUNTRY_NAME_RE.finditer(_addr_fold(c)):
+        last = m
+    return _COUNTRY_NAMES[last.group(1)] if last else None
 
 
 def _addr_tokens(c: str):
@@ -319,6 +344,7 @@ def build_address_gazetteer(df: pd.DataFrame,
         if c in df.columns:
             vals.extend(df[c].dropna().astype(str).unique().tolist())
     _ADDR_GAZETTEER = AddressGazetteer().build(vals)
+    _COUNTRY_CACHE.clear()
     return _ADDR_GAZETTEER
 
 
@@ -343,11 +369,28 @@ def _addr_lang_cc(c: str):
     return None
 
 
+_COUNTRY_CACHE = {}
+
+
 def country_of(cim) -> str:
-    """Egy állomás-cím országkódja ('HU', 'DE', … vagy '??' ha nem felismerhető)."""
+    """Egy állomás-cím országkódja ('HU', 'DE', … vagy '??' ha nem felismerhető).
+
+    Teljesítmény (v4.8): a feloldás eredménye címenként cache-elve — a fuvarnaplóban
+    ~7000 cím-előfordulásra ~1000 egyedi cím jut, és a függvény a legforgalmasabb
+    hívási útvonalon van (is_hu_address → irány-osztályozás, típus-validáció).
+    A cache a gazetteer újraépítésekor ürül.
+    """
     c = str(cim or '').strip()
     if not c:
         return '??'
+    hit = _COUNTRY_CACHE.get(c)
+    if hit is not None:
+        return hit
+    _COUNTRY_CACHE[c] = res = _country_of_uncached(c)
+    return res
+
+
+def _country_of_uncached(c: str) -> str:
     cc = _addr_prefix_cc(c)
     if cc:
         return cc
@@ -518,10 +561,12 @@ def _van_datum_anomalia(group: pd.DataFrame) -> bool:
     return bool((le.notna() & fel.notna() & (le < fel)).any())
 
 
-def _reszfeladat_sorrend_elter(group: pd.DataFrame) -> bool:
+def _reszfeladat_sorrend_elter(group: pd.DataFrame, torzs=None) -> bool:
     """Igaz, ha a részfeladat-sorszámok sorrendje eltér az időrendtől."""
-    ordered = _sort_legs_chronologically(group)
-    nums = [n for n in ordered['_reszfeladat'].tolist() if pd.notna(n)]
+    if torzs is None:
+        torzs = _torzs_of(str(group['Fuvarszám'].iloc[0])) if len(group) else ''
+    recs = _order_records(_leg_records(torzs, group), 'chrono')
+    nums = [l['_rf_raw'] for l in recs if l['_rf_raw'] is not None]
     return len(nums) > 1 and nums != sorted(nums)
 
 
@@ -617,23 +662,43 @@ def get_interval_with_addresses(legs_df: pd.DataFrame):
         if c not in legs_df.columns:
             return pd.NaT, None, pd.NaT, None
 
-    legs_df = legs_df.copy()
-    legs_df['_torzs'] = legs_df['Fuvarszám'].astype(str).map(_torzs_of)
+    # Teljesítmény (v4.8): oszlop-listákon dolgozunk, pandas copy/groupby nélkül —
+    # ez a függvény körönként 3-4x hívódik (kifelé/semleges/befelé szakaszokra).
+    fsz = legs_df['Fuvarszám'].astype(str).tolist()
+    fdt = legs_df['Első Felvételi állomás időkapu (dátum)'].tolist()
+    ldt = legs_df['Utolsó Leadási állomás időkapu (dátum)'].tolist()
+    fad = legs_df['Első Felvételi állomás cím'].tolist()
+    lad = legs_df['Utolsó Leadási állomás cím'].tolist()
+
+    per_torzs = {}
+    for i, f in enumerate(fsz):
+        per_torzs.setdefault(_torzs_of(f), []).append(i)
 
     start_candidates = []
     end_candidates = []
-    for _torzs, grp in legs_df.groupby('_torzs'):
-        row_start, row_end = _torzs_start_end(grp)
-        if row_start is not None:
-            sdt = row_start['Első Felvételi állomás időkapu (dátum)']
-            sad = row_start['Első Felvételi állomás cím']
-            if pd.notna(sdt):
-                start_candidates.append((sdt, sad))
-        if row_end is not None:
-            edt = row_end['Utolsó Leadási állomás időkapu (dátum)']
-            ead = row_end['Utolsó Leadási állomás cím']
-            if pd.notna(edt):
-                end_candidates.append((edt, ead))
+    # A törzsek bejárása rendezetten (mint a korábbi pandas groupby), hogy az
+    # időkapu-holtversenyeknél ugyanaz a cím nyerjen, mint eddig.
+    for _t in sorted(per_torzs):
+        idxs = per_torzs[_t]
+        rf = [(i, _reszfeladat_of(fsz[i])) for i in idxs]
+        with_rf = [(i, n) for i, n in rf if n is not None]
+        if with_rf:
+            if len(with_rf) > 1:
+                i_start = min(with_rf, key=lambda x: x[1])[0]
+                i_end = max(with_rf, key=lambda x: x[1])[0]
+            else:
+                i_start = i_end = with_rf[0][0]
+        else:
+            cand_s = [i for i in idxs if pd.notna(fdt[i])]
+            cand_e = [i for i in idxs if pd.notna(ldt[i])]
+            if not cand_s or not cand_e:
+                continue
+            i_start = min(cand_s, key=lambda i: fdt[i])
+            i_end = max(cand_e, key=lambda i: ldt[i])
+        if pd.notna(fdt[i_start]):
+            start_candidates.append((fdt[i_start], fad[i_start]))
+        if pd.notna(ldt[i_end]):
+            end_candidates.append((ldt[i_end], lad[i_end]))
 
     if not start_candidates or not end_candidates:
         return pd.NaT, None, pd.NaT, None
@@ -663,6 +728,87 @@ def _classify_fuvarfeladat_type_expected(tipus_str) -> str:
     return 'ISMERETLEN'
 
 
+# Teljesítmény (v4.8): a törzsenkénti láb-rekordok EGYSZER készülnek el (pandas
+# iterrows + cím-feloldás), a három lehetséges sorrend utána már csak listát rendez.
+# Korábban minden sorrend-variáns külön DataFrame copy+sort_values volt, ami a
+# futásidő felét vitte (16 000+ sort_values hívás egy 2200 körös futáson).
+_TORZS_LEGS_CACHE = {}
+_TORZS_ANALYSIS_CACHE = {}
+
+_DT_MIN = pd.Timestamp.min
+_DT_MAX = pd.Timestamp.max
+
+
+def _leg_records(torzs, torzs_group: pd.DataFrame):
+    """Egy törzs lábai plain dict-ekként, rendezési kulcsokkal. Cache-elt."""
+    key = str(torzs)
+    hit = _TORZS_LEGS_CACHE.get(key)
+    if hit is not None:
+        return hit
+    n = len(torzs_group)
+    cols = torzs_group.columns
+
+    def col(name, default=None):
+        if name in cols:
+            return torzs_group[name].tolist()
+        return [default] * n
+
+    c_fsz = [str(x) for x in col('Fuvarszám', '')]
+    c_jsz = [str(x) for x in col('Járatszám', '')]
+    c_fel = col('Első Felvételi állomás cím', '')
+    c_le = col('Utolsó Leadási állomás cím', '')
+    c_dij = col('Díj részarány (EUR)', 0)
+    c_tip = col('Fuvarfeladat típusa', '')
+    c_fdt = col('Első Felvételi állomás időkapu (dátum)')
+    c_ldt = col('Utolsó Leadási állomás időkapu (dátum)')
+    c_von = col('Vontatmány', '')
+
+    recs = []
+    for i in range(n):
+        fel = str(c_fel[i] or '').strip()
+        le = str(c_le[i] or '').strip()
+        rf = _reszfeladat_of(c_fsz[i])
+        fel_dt, le_dt = c_fdt[i], c_ldt[i]
+        try:
+            dij = float(c_dij[i])
+            if dij != dij:  # NaN
+                dij = 0.0
+        except (TypeError, ValueError):
+            dij = 0.0
+        recs.append({
+            'fsz': c_fsz[i],
+            'jsz': c_jsz[i],
+            'fel': fel, 'le': le,
+            'fel_hu': country_of(fel) == 'HU', 'le_hu': country_of(le) == 'HU',
+            'dij': dij,
+            'tipus': str(c_tip[i] or ''),
+            'vontatmany': str(c_von[i] or ''),
+            '_rf': (1, 0) if rf is None else (0, rf),
+            '_fel': (1, _DT_MIN) if pd.isna(fel_dt) else (0, pd.Timestamp(fel_dt)),
+            '_le': (1, _DT_MIN) if pd.isna(le_dt) else (0, pd.Timestamp(le_dt)),
+            '_rf_raw': rf,
+            '_fel_raw': None if pd.isna(fel_dt) else pd.Timestamp(fel_dt),
+            '_le_raw': None if pd.isna(le_dt) else pd.Timestamp(le_dt),
+        })
+    _TORZS_LEGS_CACHE[key] = recs
+    return recs
+
+
+def _order_records(recs, order):
+    """Láb-rekordok rendezése a három lehetséges kulcs szerint (lista-rendezés)."""
+    if order == 'chrono':
+        return sorted(recs, key=lambda r: (r['_fel'], r['_le'], r['_rf']))
+    if order == 'leadas':
+        return sorted(recs, key=lambda r: (r['_le'], r['_fel'], r['_rf']))
+    return sorted(recs, key=lambda r: (r['_rf'], r['_fel']))
+
+
+def _reset_torzs_caches():
+    _TORZS_LEGS_CACHE.clear()
+    _TORZS_ANALYSIS_CACHE.clear()
+    _ORDER_RESOLVED_TORZSEK.clear()
+
+
 def _analyze_torzs_type_ordered(torzs: str, torzs_group: pd.DataFrame,
                                 window_end=None, order='reszfeladat',
                                 window_start=None):
@@ -690,33 +836,14 @@ def _analyze_torzs_type_ordered(torzs: str, torzs_group: pd.DataFrame,
     if torzs_group is None or torzs_group.empty:
         return None
 
-    grp = torzs_group.copy()
-    if order == 'chrono':
-        grp = _sort_legs_chronologically(grp)
-    elif order == 'leadas':
-        grp = _sort_legs_by_leadas(grp)
-    else:
-        grp = _sort_legs_by_reszfeladat(grp)
-
-    legs = []
-    for _, r in grp.iterrows():
-        fel = str(r.get('Első Felvételi állomás cím', '') or '').strip()
-        le = str(r.get('Utolsó Leadási állomás cím', '') or '').strip()
-        dij = pd.to_numeric(r.get('Díj részarány (EUR)'), errors='coerce')
-        legs.append({
-            'fsz': str(r['Fuvarszám']),
-            'jsz': str(r['Járatszám']),
-            'fel': fel, 'le': le,
-            'fel_hu': is_hu_address(fel), 'le_hu': is_hu_address(le),
-            'dij': float(dij) if pd.notna(dij) else 0.0,
-        })
+    legs = _order_records(_leg_records(torzs, torzs_group), order)
     if not legs:
         return None
 
     first, last = legs[0], legs[-1]
     fel_hu, le_hu = first['fel_hu'], last['le_hu']
     viszonylat = f"{first['fel']}  →  {last['le']}"
-    tipus_str = str(grp.iloc[0].get('Fuvarfeladat típusa', '') or '')
+    tipus_str = first['tipus']
     expected = _classify_fuvarfeladat_type_expected(tipus_str)
 
     def _res(hiba, javaslat, implies_complete=False, window_truncated=False,
@@ -737,11 +864,7 @@ def _analyze_torzs_type_ordered(torzs: str, torzs_group: pd.DataFrame,
     # A törzs utolsó aktivitása + időszak-vég közelség (v4.6): ha a törzs a
     # feltöltött adatablak utolsó napjaiban szakad félbe, a hiányzó nemzetközi /
     # hazatérő részfeladat valószínűleg az időszak UTÁN van → nem hiba.
-    _dates = []
-    for _c in ('Első Felvételi állomás időkapu (dátum)',
-               'Utolsó Leadási állomás időkapu (dátum)'):
-        if _c in grp.columns:
-            _dates.extend(pd.to_datetime(grp[_c], errors='coerce').dropna().tolist())
+    _dates = [d for l in legs for d in (l['_fel_raw'], l['_le_raw']) if d is not None]
     last_activity = max(_dates) if _dates else None
     first_activity = min(_dates) if _dates else None
     # v4.7: az adatablak ELEJÉN csonkolt törzs (a v4.6-os ablak-vég logika tükörképe)
@@ -954,23 +1077,28 @@ def analyze_torzs_type(torzs: str, torzs_group: pd.DataFrame, window_end=None,
     sorrend-hibáról van szó → nem adunk típushibát, a törzs a
     "Részfeladat-sorrend eltérés" riportba kerül.
     """
+    _ckey = str(torzs)
+    if _ckey in _TORZS_ANALYSIS_CACHE:
+        return _TORZS_ANALYSIS_CACHE[_ckey]
+
     res = _analyze_torzs_type_ordered(torzs, torzs_group, window_end=window_end,
                                       order='reszfeladat', window_start=window_start)
     if res is None:
+        _TORZS_ANALYSIS_CACHE[_ckey] = None
         return None
 
     # Alternatív, ugyanennyire hihető lábsorrendek. Ha BÁRMELYIK konzisztens
     # láncot ad, a rögzítési sorrend a bizonytalan, nem a fuvarfeladat típusa.
-    base_seq = list(_sort_legs_by_reszfeladat(torzs_group)['Fuvarszám'].astype(str))
+    _recs = _leg_records(torzs, torzs_group)
+    base_seq = [l['fsz'] for l in _order_records(_recs, 'reszfeladat')]
     for alt_order in ('chrono', 'leadas'):
-        alt_sorter = (_sort_legs_chronologically if alt_order == 'chrono'
-                      else _sort_legs_by_leadas)
-        if list(alt_sorter(torzs_group)['Fuvarszám'].astype(str)) == base_seq:
+        if [l['fsz'] for l in _order_records(_recs, alt_order)] == base_seq:
             continue
         alt = _analyze_torzs_type_ordered(torzs, torzs_group, window_end=window_end,
                                           order=alt_order, window_start=window_start)
         if alt is None:
             _ORDER_RESOLVED_TORZSEK[str(torzs)] = res.get('hiba', '')
+            _TORZS_ANALYSIS_CACHE[_ckey] = None
             return None
 
     # Marad a hiba – de ha dátum-anomália is van a törzsben (leadás < felvétel),
@@ -980,6 +1108,7 @@ def analyze_torzs_type(torzs: str, torzs_group: pd.DataFrame, window_end=None,
         res['hiba'] = (res['hiba'] + ' ⚠️ FIGYELEM: a törzsben dátum-anomália is van '
                        '(leadási időkapu korábbi a felvételinél) — a hibajelzés ebből '
                        'is eredhet, előbb az időkapukat érdemes ellenőrizni.')
+    _TORZS_ANALYSIS_CACHE[_ckey] = res
     return res
 
 
@@ -1134,7 +1263,7 @@ def build_full_kor_explanation(legs_ordered, torzsek_a_korben, torzs_history_map
                                torzs_group_map, ures_visszafutas_gyanu=False,
                                implies_complete=False, idoszak_utan_zarodo=False,
                                window_end=None, harmadik_orszagos_zaras=False,
-                               idoszak_elott_kezdodo=False):
+                               idoszak_elott_kezdodo=False, window_start=None):
     """Összeállítja a kör teljes magyarázatát több szempont figyelembevételével:
       1) Vontatmány váltás minden érintett törzsre
          v4.1: ha a törzs MINDEN részfeladata ebben a körben van (a törzs-alapú
@@ -1190,7 +1319,8 @@ def build_full_kor_explanation(legs_ordered, torzsek_a_korben, torzs_history_map
         grp = torzs_group_map.get(torzs)
         if grp is None:
             continue
-        errs = validate_torzs_type(torzs, grp, window_end=window_end)
+        errs = validate_torzs_type(torzs, grp, window_end=window_end,
+                                   window_start=window_start)
         for e in errs:
             parts.append(e)
             has_tipus_hiba = True
@@ -1363,7 +1493,7 @@ def generate_result_df(df: pd.DataFrame) -> pd.DataFrame:
     # Cím-gazetteer építése a teljes adathalmazból (v4.7) – a prefix nélküli
     # címek országa a prefixes címekből tanult (irányítószám, város) párokból jön.
     build_address_gazetteer(df)
-    _ORDER_RESOLVED_TORZSEK.clear()
+    _reset_torzs_caches()
 
     # Előindexelés törzsenként (vontatmány-váltás leíráshoz és típus-validációhoz)
     tmp_torzs = df['Fuvarszám'].astype(str).map(_torzs_of)
@@ -1371,15 +1501,13 @@ def generate_result_df(df: pd.DataFrame) -> pd.DataFrame:
 
     torzs_history_map = {}
     for torzs, grp in df_indexed.groupby('_torzs'):
-        grp = grp.copy()
-        grp = _sort_legs_by_reszfeladat(grp)
         torzs_history_map[torzs] = [
             {
-                'fuvarszám': str(r['Fuvarszám']),
-                'járatszám': str(r['Járatszám']),
-                'vontatmány': str(r['Vontatmány']),
+                'fuvarszám': l['fsz'],
+                'járatszám': l['jsz'],
+                'vontatmány': l['vontatmany'],
             }
-            for _, r in grp.iterrows()
+            for l in _order_records(_leg_records(torzs, grp), 'reszfeladat')
         ]
 
     torzs_group_map = {
@@ -1621,6 +1749,7 @@ def generate_result_df(df: pd.DataFrame) -> pd.DataFrame:
             idoszak_utan_zarodo=bool(row.get('_Idoszak_utan_zarodo')),
             idoszak_elott_kezdodo=bool(row.get('_Idoszak_elott_kezdodo')),
             window_end=window_end,
+            window_start=window_start,
             harmadik_orszagos_zaras=bool(row.get('_Harmadik_orszagos_zaras')),
         )
         magy.append(exp)
@@ -1643,8 +1772,9 @@ def build_tipushiba_table(result_df: pd.DataFrame, df: pd.DataFrame) -> pd.DataF
             _torzs=df['Fuvarszám'].astype(str).map(_torzs_of)
         ).groupby('_torzs')
     }
-    window_end = df['Utolsó Leadási állomás időkapu (dátum)'].max() \
-        if 'Utolsó Leadási állomás időkapu (dátum)' in df.columns else None
+    _has_dt = 'Utolsó Leadási állomás időkapu (dátum)' in df.columns
+    window_end = df['Utolsó Leadási állomás időkapu (dátum)'].max() if _has_dt else None
+    window_start = df['Utolsó Leadási állomás időkapu (dátum)'].min() if _has_dt else None
     rows = []
     seen = set()
     for _, r in result_df.iterrows():
@@ -1652,13 +1782,16 @@ def build_tipushiba_table(result_df: pd.DataFrame, df: pd.DataFrame) -> pd.DataF
             if t in seen:
                 continue
             seen.add(t)
-            res = analyze_torzs_type(t, torzs_group_map.get(t), window_end=window_end)
+            res = analyze_torzs_type(t, torzs_group_map.get(t), window_end=window_end,
+                                     window_start=window_start)
             if res is None:
                 continue
             rows.append({
                 'Törzs': res['torzs'],
                 'Kör ID': r['Kör ID'],
-                'Kategória': ('időszak után záródó (nem hiba)'
+                'Kategória': ('időszak előtt kezdődő (nem hiba)'
+                              if res.get('window_start_truncated')
+                              else 'időszak után záródó (nem hiba)'
                               if res.get('window_truncated') else 'javítandó hiba'),
                 'Fuvarszámok': res['fuvarszamok'],
                 'Járatszámok': res['jaratszamok'],
@@ -2766,10 +2899,29 @@ if uploaded_logbooks:
                             styles.append('')
                     return styles
 
-                _shown = _disp.drop(columns=['Magyarázat_szín'], errors='ignore')
+                # v4.8 – teljesítmény: nagy táblánál nem rajzolunk Styler-t, mert a
+                # soronkénti HTML-generálás több ezer sornál használhatatlanná teszi
+                # az oldalt. A teljes tábla a letöltött Excelben van.
+                _full_len = len(_disp)
+                _show_all = False
+                if _full_len > UI_PREVIEW_ROWS:
+                    _show_all = st.checkbox(
+                        f'Teljes tábla megjelenítése ({_full_len} sor) – lassú lehet',
+                        value=False, key=f'showall_{_label}')
+                _disp_ui = _disp if _show_all else _disp.head(UI_PREVIEW_ROWS)
+                if not _show_all and _full_len > UI_PREVIEW_ROWS:
+                    st.caption(
+                        f'Előnézet: az első {UI_PREVIEW_ROWS} kör a(z) {_full_len}-ből. '
+                        f'A teljes tábla a fenti letöltött Excelben van.')
+
+                _shown = _disp_ui.drop(columns=['Magyarázat_szín'], errors='ignore')
+                if len(_disp_ui) > UI_PREVIEW_ROWS:
+                    # Színezés nélküli, virtualizált tábla – ez bírja a nagy adatot
+                    st.dataframe(_shown, use_container_width=True)
+                    continue
                 try:
-                    _styler = _disp.style.apply(_highlight_cells, axis=1, subset=None)
-                    if 'Magyarázat_szín' in _disp.columns:
+                    _styler = _disp_ui.style.apply(_highlight_cells, axis=1, subset=None)
+                    if 'Magyarázat_szín' in _disp_ui.columns:
                         _styler = _styler.hide(axis='columns', subset=['Magyarázat_szín'])
                     _header_styles = []
                     for _i, _col in enumerate(list(_shown.columns)):
